@@ -44,16 +44,19 @@ describe("final CTA portrait", () => {
 
   it("matches the 4:5 box the component reserves", () => {
     const { width, height } = webpSize(landingCopy);
-    // FinalCTAPortrait passes width={1122} height={1402}; a re-crop that
-    // changes the ratio would letterbox her or crop her head.
+    // FinalCTAPortrait passes width={1123} height={1400} — the file's real
+    // pixels. A re-crop that changes the ratio would letterbox her or crop her
+    // head; a swap that changes the pixels without updating BOTH components
+    // would reserve the wrong box and shift the section as she loads.
     expect(width / height).toBeCloseTo(4 / 5, 2);
-    expect(width).toBe(1122);
-    expect(height).toBe(1402);
+    expect(width).toBe(1123);
+    expect(height).toBe(1400);
   });
 
   it("ships optimised, not as the original export", () => {
-    // The source PNG was 1.77 MB; the WebP is ~57 KB. Anything approaching the
-    // original means someone committed the raw export again.
+    // The WhatsApp original is 79 KB of already-lossy JPEG; this is ~40 KB of
+    // WebP re-encoded from it at q82. Anything approaching the raw exports the
+    // owner uploads means someone committed one straight into public/.
     expect(statSync(landingCopy).size).toBeLessThan(200 * 1024);
   });
 });
