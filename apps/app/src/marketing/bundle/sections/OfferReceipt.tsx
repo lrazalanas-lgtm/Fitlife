@@ -7,10 +7,18 @@ import { CONFIG } from "@/marketing/bundle/config";
 // warm paper on the night hero, dotted ledger leaders, struck total, the
 // gold 888 (ticker), a barcode strip and a wax-seal savings sticker. All
 // server-rendered except the ticker.
+// These four figures ARE the struck total: they sum to CONFIG.originalValue
+// (700 + 300 + 350 + 200 = 1550), and the savings sticker below is that minus
+// the bundle price. The meal-plan row used to read «350–450», which made the
+// real sum a RANGE of 1550-1650 — that is why both totals said «أكثر من».
+// Owner correction (08/2026): the meal plan is 350 flat, so the sum is now
+// exact and the «أكثر من» came off the totals with it. Change a figure here
+// and CONFIG.originalValue/savings must move too, or the receipt stops adding
+// up in front of the customer.
 const PAID_ROWS = [
   { name: "الاستشارة + المتابعة الجماعية", value: "700" },
   { name: "برنامج تمارين مناسب لك", value: "300" },
-  { name: "جدول غذائي حسب سعراتك", value: "350–450" },
+  { name: "جدول غذائي حسب سعراتك", value: "350" },
   { name: "ملف كنز الوصفات الصحية", value: "200" },
 ] as const;
 
@@ -71,7 +79,7 @@ export function OfferReceipt() {
           <p className="flex flex-wrap items-center justify-between gap-x-3 text-sm text-brand-ink-muted">
             <span>المجموع لو اشتريتيها منفصلة</span>
             <s className="font-bold whitespace-nowrap tabular-nums">
-              أكثر من {CONFIG.originalValue.toLocaleString("en-US")} ر.س
+              {CONFIG.originalValue.toLocaleString("en-US")} ر.س
             </s>
           </p>
           <p className="mt-2 flex items-baseline justify-between">
