@@ -20,7 +20,7 @@ const PAID_ITEMS = [
   },
   {
     title: "جدول غذائي حسب سعراتك",
-    value: "قيمته 350 – 450 ر.س",
+    value: "قيمته 350 ر.س",
     description:
       "جدول مبني على احتياجك الفعلي من السعرات (من 1800 إلى 2900 سعرة)، بأكل واقعي يناسب سفرتنا — بدون حرمان وبدون تعقيد.",
   },
@@ -148,7 +148,6 @@ export function ValueStack() {
           <p className="max-w-2xl text-lg leading-[1.8] text-white md:text-xl">
             المجموع لو اشتريتيها منفصلة:{" "}
             <s className="font-bold text-white/55">
-              أكثر من{" "}
               <span className="tabular-nums">
                 {CONFIG.originalValue.toLocaleString("en-US")}
               </span>{" "}
