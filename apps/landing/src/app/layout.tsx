@@ -13,8 +13,13 @@ const tajawal = Tajawal({
 
 const TITLE =
   "باقة التحوّل الشاملة | Fit Life — استشارة + تمارين + تغذية بـ 888 ر.س";
+// This is the WhatsApp/social share card, so it quotes the same total the
+// page's own receipt adds up to. The figure is written out rather than read
+// from CONFIG (metadata is a static export), so it has to be moved by hand
+// whenever a row's value changes — it said «أكثر من 1,550» until the meal
+// plan stopped being a 350-450 range and the sum became exactly 1,550.
 const DESCRIPTION =
-  "7 منتجات في عملية شراء واحدة: استشارة ومتابعة، برنامج تمارين، جدول غذائي حسب سعراتك، كنز الوصفات — قيمتها أكثر من 1,550 ر.س، اليوم بـ 888 ر.س فقط.";
+  "7 منتجات في عملية شراء واحدة: استشارة ومتابعة، برنامج تمارين، جدول غذائي حسب سعراتك، كنز الوصفات — قيمتها 1,550 ر.س، اليوم بـ 888 ر.س فقط.";
 
 export const metadata: Metadata = {
   // Checklist: point NEXT_PUBLIC_SITE_URL at the production domain before launch.
