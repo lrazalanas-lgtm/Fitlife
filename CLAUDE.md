@@ -961,13 +961,17 @@ waste.
 2600 the fossil-removal alone would give: the cap must sit ABOVE the measured pretty-mode
 emission ~17.5k @ 5 members until compact is proven, or every non-compact reply truncates
 into the doubled-cap retry — verifier catch). `bigCallTimeoutMs` = 240s + 40s/member
-(360s @ 5, was 450s). Compact JSON is pinned twice: a directive in the day + skeleton
-prompts (dynamic blocks only — cached STATIC_SYSTEM untouched, no invalidation) AND an
-**assistant prefill** (`streamAnthropic` gained `assistantPrefill`; day = `{"d":`,
-skeleton = `{`). The returned `text` and any error's `partialText` INCLUDE the prefill, so
-parse/salvage paths prepend nothing — `anthropicStream.test.ts` pins that contract with a
-faked SSE body, because every other test mocks `streamAnthropic` wholesale and a
-regression would break salvage silently. The small-household cliff is fixed:
+(360s @ 5, was 450s). Compact JSON is pinned by a directive in the day + skeleton
+prompts (dynamic blocks only — cached STATIC_SYSTEM untouched, no invalidation). An
+**assistant prefill** was ALSO built for this and REMOVED the same day: the very first
+production run answered `Anthropic API 400: This model does not support assistant message
+prefill` — claude-sonnet-4-6 requires the conversation to end with a USER message, so the
+directive + the generous caps carry compact-emission alone (which is exactly why the caps
+were sized above pretty mode). The failure was itself a validation of Stage 1: a
+deterministic 400 failed in 26s at $0 with the cause legible in `error_message`, instead
+of burning retries. `anthropicStream.test.ts` pins the stream-death error contract with a
+faked SSE body (every other test mocks `streamAnthropic` wholesale, so a regression there
+would break salvage silently) and that requests end with a user turn. The small-household cliff is fixed:
 `dayConcurrency` for 1/2/3 members is now 2/3/4 (sequential-1 could not fit a week from
 3 members up, or 2 with a maid — the calm 1→7 fill was arithmetically unaffordable);
 `PLAN_DAY_CONCURRENCY` now overrides small households too.

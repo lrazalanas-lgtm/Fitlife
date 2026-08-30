@@ -312,18 +312,6 @@ export function summarizeDayErrors(errors: string[]): string {
 // giving up (separate from MAX_RETRIES, which governs API-transient retries).
 const CONTENT_MAX_RETRIES = 2;
 
-// Assistant prefills pinning the reply's opening bytes (see streamAnthropic's
-// assistantPrefill). The day slice's documented root is `{"d":<day_index>,...}`
-// so its prefill pins the first key; the skeleton's key order is not pinned by
-// its schema, so only the root brace is forced there. Either way a reply cannot
-// open with a fence, a prose preamble, or an indented root — which, with the
-// compact directive in the prompts, is what holds emission in the measured
-// 0.54 tok/byte mode instead of the +80% pretty mode. streamAnthropic returns
-// text (and error partialText) WITH the prefill included, so parse and salvage
-// paths need no prepending here.
-const DAY_REPLY_PREFILL = '{"d":';
-const SKELETON_REPLY_PREFILL = "{";
-
 /**
  * Why a day carries no meals when the run ran out of budget rather than failing.
  * Distinct wording on purpose: it lands in `plan_generations.error_message` via
@@ -1669,7 +1657,6 @@ export async function generateMealPlan(params: {
         systemStatic: STATIC_SYSTEM,
         systemPrompt: skeletonSystemPrompt,
         timeoutMs: skeletonTimeoutFor(),
-        assistantPrefill: SKELETON_REPLY_PREFILL,
       });
     // The skeleton is the run's single point of failure and it used to be the
     // only call with NO retry of any kind (except max_tokens): every day call
@@ -2175,7 +2162,6 @@ export async function generateMealPlan(params: {
               systemStatic: STATIC_SYSTEM,
               systemPrompt: prompt,
               timeoutMs: callTimeout(),
-              assistantPrefill: DAY_REPLY_PREFILL,
             });
         salvagedSlice = null;
         totalIn += res.tokensIn;

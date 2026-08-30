@@ -38,15 +38,12 @@ export async function streamAnthropic(params: {
   // reader.read() forever, hanging the day loop and never flipping generating
   // off. Aborting kills both. Defaults to 4 min; callers inherit it.
   timeoutMs?: number;
-  // Sent as a final ASSISTANT message so the reply CONTINUES it — pinning the
-  // opening bytes of the payload. This is what makes compact emission stick:
-  // measured tok/byte on production runs is bimodal (0.54 compact vs 0.97
-  // pretty-printed, +80% output tokens when pretty), and a reply that begins
-  // inside compact JSON cannot open with a fence, a prose preamble, or an
-  // indented root. The returned `text` (and any error's partialText) INCLUDES
-  // the prefill, so callers parse a complete payload without prepending
-  // anything. Must not end with whitespace (API constraint).
-  assistantPrefill?: string;
+  // NOTE deliberately absent: assistant prefill. Pinning the reply's opening
+  // bytes with a trailing assistant message was tried for compact-JSON
+  // enforcement and REJECTED BY THE API — claude-sonnet-4-6 returns 400
+  // "This model does not support assistant message prefill" (measured on
+  // production, 08/30). Compact emission rides on the prompt directive alone,
+  // and the token caps are sized so a pretty-printed reply still fits.
 }): Promise<StreamResult> {
   const {
     apiKey,
@@ -58,16 +55,12 @@ export async function streamAnthropic(params: {
     messages,
     onText,
     timeoutMs = 240_000,
-    assistantPrefill,
   } = params;
 
-  const baseMessages =
+  const requestMessages =
     messages && messages.length > 0
       ? messages
       : [{ role: "user" as const, content: userMessage }];
-  const requestMessages = assistantPrefill
-    ? [...baseMessages, { role: "assistant" as const, content: assistantPrefill }]
-    : baseMessages;
 
   const system = systemStatic
     ? [
@@ -130,10 +123,7 @@ export async function streamAnthropic(params: {
       );
     }
 
-    // Seeded with the prefill so callers always see the complete payload; the
-    // estimate below deliberately measures only what STREAMED (the prefill is
-    // prompt-side, never billed as output).
-    let text = assistantPrefill ?? "";
+    let text = "";
     let streamedAny = false;
     let tokensIn = 0;
     let tokensOut = 0;
@@ -144,9 +134,7 @@ export async function streamAnthropic(params: {
     // an estimate marked as such beats recording 0 for a call that billed 25k.
     const estimatedStreamedTokens = (): number | undefined => {
       if (!streamedAny) return undefined;
-      const streamedBytes = new TextEncoder().encode(
-        text.slice(assistantPrefill?.length ?? 0),
-      ).length;
+      const streamedBytes = new TextEncoder().encode(text).length;
       return Math.max(1, Math.round(streamedBytes * 0.6));
     };
 

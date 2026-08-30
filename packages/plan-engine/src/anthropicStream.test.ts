@@ -6,18 +6,18 @@ import { isRetryable } from "./generate";
 /**
  * The real streaming path, against a faked SSE body. Everything else in the
  * suite mocks `streamAnthropic` wholesale, so these are the only tests that
- * pin its contract — two clauses of which the whole reliability layer leans on:
+ * pin its error contract — which the whole reliability layer leans on:
  *
- * 1. `text` (and any error's `partialText`) INCLUDES the assistant prefill, so
- *    parse and salvage paths never prepend anything. A regression here breaks
- *    the salvage silently: rescueDaySlice would see JSON missing its opening
- *    bytes and return null on every rescue — the exact bug class the verifier
- *    flagged.
- * 2. A mid-body death of ANY kind surfaces as AnthropicCallError with the
- *    streamed text attached and "stream error" in the message, so it is
- *    retryable AND salvageable, and carries the billed-but-unreported token
- *    estimate. undici's `TypeError: terminated` used to propagate raw: not
- *    retryable, not salvageable, $2.02 of one production run discarded whole.
+ * A mid-body death of ANY kind must surface as AnthropicCallError with the
+ * streamed text attached and "stream error" in the message, so it is retryable
+ * AND salvageable, and carries the billed-but-unreported token estimate.
+ * undici's `TypeError: terminated` used to propagate raw: not retryable, not
+ * salvageable, $2.02 of one production run discarded whole.
+ *
+ * (Assistant prefill was tried here for compact-JSON pinning and REJECTED by
+ * the API — claude-sonnet-4-6 answers 400 "This model does not support
+ * assistant message prefill", measured on production 08/30. So there is no
+ * prefill contract to pin; compact rides on the prompt directive alone.)
  */
 
 const enc = new TextEncoder();
@@ -61,37 +61,14 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("assistant prefill", () => {
-  it("returns text WITH the prefill, and sends it as the final assistant turn", async () => {
-    let sentBody: { messages?: Array<{ role: string; content: string }> } = {};
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (_url: string, init: RequestInit) => {
-        sentBody = JSON.parse(String(init.body));
-        return sseResponse([messageStart, delta('0,"ms":[]}'), messageDelta]);
-      }),
-    );
-    const res = await streamAnthropic({
-      apiKey: "k",
-      model: "m",
-      maxTokens: 100,
-      systemPrompt: "s",
-      assistantPrefill: '{"d":',
-    });
-    expect(res.text).toBe('{"d":0,"ms":[]}');
-    const last = sentBody.messages![sentBody.messages!.length - 1]!;
-    expect(last).toEqual({ role: "assistant", content: '{"d":' });
-    expect(res.tokensIn).toBe(1234);
-    expect(res.tokensOut).toBe(42);
-  });
-
-  it("changes nothing when no prefill is given (chat callers)", async () => {
+describe("the happy path", () => {
+  it("accumulates deltas and usage; no extra messages are fabricated", async () => {
     let sentBody: { messages?: unknown[] } = {};
     vi.stubGlobal(
       "fetch",
       vi.fn(async (_url: string, init: RequestInit) => {
         sentBody = JSON.parse(String(init.body));
-        return sseResponse([messageStart, delta("hello"), messageDelta]);
+        return sseResponse([messageStart, delta('{"d":0,'), delta('"ms":[]}'), messageDelta]);
       }),
     );
     const res = await streamAnthropic({
@@ -100,8 +77,14 @@ describe("assistant prefill", () => {
       maxTokens: 100,
       systemPrompt: "s",
     });
-    expect(res.text).toBe("hello");
-    expect(sentBody.messages).toHaveLength(1);
+    expect(res.text).toBe('{"d":0,"ms":[]}');
+    expect(res.tokensIn).toBe(1234);
+    expect(res.tokensOut).toBe(42);
+    expect(res.stopReason).toBe("end_turn");
+    // The conversation must end with a user message — claude-sonnet-4-6
+    // rejects a trailing assistant turn outright (API 400, measured on prod).
+    const messages = sentBody.messages as Array<{ role: string }>;
+    expect(messages[messages.length - 1]!.role).toBe("user");
   });
 });
 
@@ -112,7 +95,7 @@ describe("mid-body stream death", () => {
       vi.fn(async () =>
         sseResponse([
           messageStart,
-          delta('0,"ms":[{"id":"mom"}'),
+          delta('{"d":0,"ms":[{"id":"mom"}'),
           new TypeError("terminated"),
         ]),
       ),
@@ -122,19 +105,17 @@ describe("mid-body stream death", () => {
       model: "m",
       maxTokens: 100,
       systemPrompt: "s",
-      assistantPrefill: '{"d":',
     }).then(
       () => null,
       (e: unknown) => e,
     );
     expect(err).toBeInstanceOf(AnthropicCallError);
     const e = err as AnthropicCallError;
-    // partialText includes the prefill — the salvage parses it as-is.
     expect(e.partialText).toBe('{"d":0,"ms":[{"id":"mom"}');
     // "stream error" in the message is what isRetryable keys on.
     expect(isRetryable(e)).toBe(true);
-    // The billed-but-unreported spend: estimated from streamed bytes only
-    // (never the prefill — that is prompt-side), input from message_start.
+    // The billed-but-unreported spend: estimated from streamed bytes, input
+    // real from message_start.
     expect(e.estimatedOutputTokens).toBeGreaterThan(0);
     expect(e.inputTokensAtFailure).toBe(1234);
   });
@@ -145,7 +126,7 @@ describe("mid-body stream death", () => {
       vi.fn(async () =>
         sseResponse([
           messageStart,
-          delta('0,"ms":['),
+          delta('{"d":0,"ms":['),
           sseEvent({ type: "error", error: { type: "overloaded_error" } }),
         ]),
       ),
@@ -155,7 +136,6 @@ describe("mid-body stream death", () => {
       model: "m",
       maxTokens: 100,
       systemPrompt: "s",
-      assistantPrefill: '{"d":',
     }).then(
       () => null,
       (e: unknown) => e,
@@ -169,8 +149,8 @@ describe("mid-body stream death", () => {
 
   it("a death before any delta reports NO partial output — the diagnostics depend on the distinction", async () => {
     // "(no partial output)" vs "(salvage: nothing whole streamed)" point at
-    // different fixes (call length vs match strictness); a prefill-only
-    // partialText would collapse them again.
+    // different fixes (call length vs match strictness); a non-empty
+    // partialText for a stream that never wrote anything would collapse them.
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => sseResponse([messageStart, new TypeError("terminated")])),
@@ -180,7 +160,6 @@ describe("mid-body stream death", () => {
       model: "m",
       maxTokens: 100,
       systemPrompt: "s",
-      assistantPrefill: '{"d":',
     }).then(
       () => null,
       (e: unknown) => e,
