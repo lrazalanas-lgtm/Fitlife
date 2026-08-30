@@ -232,7 +232,7 @@ export async function generateWorkoutPlan(params: {
         maxTokens: skeletonMaxTokens(trainees.length),
         systemStatic: WORKOUT_STATIC,
         systemPrompt: skeletonPrompt,
-        timeoutMs: bigCallTimeoutMs(trainees.length, false),
+        timeoutMs: bigCallTimeoutMs(trainees.length),
       });
       totalIn += res.tokensIn;
       totalOut += res.tokensOut;
@@ -285,10 +285,10 @@ export async function generateWorkoutPlan(params: {
         const res = await streamAnthropic({
           apiKey: anthropicApiKey,
           model: DAY_MODEL,
-          maxTokens: dayMaxTokens(1, false),
+          maxTokens: dayMaxTokens(1),
           systemStatic: WORKOUT_STATIC,
           systemPrompt: buildWorkoutMemberPrompt(context, skeleton, trainee.member_id),
-          timeoutMs: bigCallTimeoutMs(1, false),
+          timeoutMs: bigCallTimeoutMs(1),
         });
         totalIn += res.tokensIn;
         totalOut += res.tokensOut;

@@ -55,6 +55,11 @@ export {
 
 export { streamAnthropic, stripMarkdownFence, computeCostUsd } from "./anthropic";
 export type { StreamResult } from "./anthropic";
+export {
+  PLAN_CHAIN_MAX_HOPS,
+  incompleteInPlanMemberIds,
+  shouldChainContinuation,
+} from "./chain";
 
 export {
   planRunBudgetMs,

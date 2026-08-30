@@ -23,7 +23,7 @@ function skeletonTimeout(memberCount: number, deadlineMs: number | undefined, no
   return Math.max(
     MIN_VIABLE_CALL_MS,
     Math.min(
-      bigCallTimeoutMs(memberCount, false),
+      bigCallTimeoutMs(memberCount),
       remainingMs(deadlineMs, now) - DAY_CALL_ESTIMATE_MS,
     ),
   );
@@ -44,7 +44,7 @@ describe("skeleton timeout is bounded by the run budget", () => {
   it("does not inflate the timeout when budget is plentiful", () => {
     // With a full 15-minute box the work-sized value still governs.
     const deadline = NOW + 15 * 60_000;
-    expect(skeletonTimeout(3, deadline, NOW)).toBe(bigCallTimeoutMs(3, false));
+    expect(skeletonTimeout(3, deadline, NOW)).toBe(bigCallTimeoutMs(3));
   });
 
   it("never returns a timeout below the viable floor", () => {
@@ -53,8 +53,8 @@ describe("skeleton timeout is bounded by the run budget", () => {
   });
 
   it("is unbounded when no deadline is set, preserving old behaviour", () => {
-    expect(skeletonTimeout(3, undefined, NOW)).toBe(bigCallTimeoutMs(3, false));
-    expect(skeletonTimeout(6, undefined, NOW)).toBe(bigCallTimeoutMs(6, false));
+    expect(skeletonTimeout(3, undefined, NOW)).toBe(bigCallTimeoutMs(3));
+    expect(skeletonTimeout(6, undefined, NOW)).toBe(bigCallTimeoutMs(6));
   });
 
   it("the 3-member case can no longer consume the whole box", () => {

@@ -57,7 +57,7 @@ describe("the skeleton's ceiling tracks the skeleton's own work", () => {
   it("is far below the day-call ceiling at every household size", () => {
     for (const n of [1, 2, 3, 4, 5, 6]) {
       expect(skeletonTimeoutMs(n), `n=${n}`).toBeLessThan(
-        bigCallTimeoutMs(n, true),
+        bigCallTimeoutMs(n),
       );
     }
   });
@@ -66,13 +66,13 @@ describe("the skeleton's ceiling tracks the skeleton's own work", () => {
     // The measured failure: a housekeeper household of five. This asserts the
     // actual before/after, so the numbers cannot drift back without failing.
     const members = 5;
-    const perWave = bigCallTimeoutMs(members, true); // 450s of real day work
+    const perWave = bigCallTimeoutMs(members); // one wave of real day work at ceiling
 
     // BEFORE: 180s translation reserve, a ceiling shared with the day loop, and
     // a reserve of one day call.
     const oldDeadline = planRunBudgetMs() - FINALIZE_RESERVE_MS - 180_000;
     const oldSkeleton = Math.min(
-      bigCallTimeoutMs(members, false),
+      bigCallTimeoutMs(members),
       oldDeadline - DAY_CALL_ESTIMATE_MS,
     );
     expect(oldDeadline - oldSkeleton).toBeLessThan(perWave); // ← one day, $2.81
@@ -88,6 +88,32 @@ describe("the skeleton's ceiling tracks the skeleton's own work", () => {
 
   it("still gives a solo household a workable phase 1", () => {
     expect(skeletonTimeoutMs(1)).toBeGreaterThan(120_000);
+  });
+});
+
+describe("small households can actually finish a week", () => {
+  // The sequential 1→7 fill was a UX nicety that broke the product's own
+  // arithmetic: at concurrency 1 the week needs 7 waves, and from 3 members up
+  // (2 with a housekeeper) those waves exceed the day-loop deadline — the
+  // budget table said m=3 typically shipped 4-6 of 7 days, forever, with the
+  // drain re-invoking one member at a time. The fill is now 2/3/4-wide.
+  it("gives 1-3 member households enough concurrency for the week to fit the gates", () => {
+    for (const m of [1, 2, 3] as const) {
+      const conc = dayConcurrency(m, true);
+      expect(conc, `m=${m}`).toBe(m + 1);
+      const waves = Math.ceil(PLAN_WEEK_DAYS / conc);
+      const gate = dayCallEstimateMs(bigCallTimeoutMs(m));
+      // Worst deadline (translation reserve on) minus the small-household
+      // skeleton floor must hold every wave at the gate's own estimate — this
+      // is the arithmetic the old concurrency-1 fill failed.
+      const deadline = dayLoopDeadline(0, true) - MIN_VIABLE_CALL_MS;
+      expect(waves * gate, `m=${m}`).toBeLessThanOrEqual(deadline);
+    }
+  });
+
+  it("the old sequential fill provably could not fit — the cliff this replaces", () => {
+    const gate = dayCallEstimateMs(bigCallTimeoutMs(3));
+    expect(PLAN_WEEK_DAYS * gate).toBeGreaterThan(dayLoopDeadline(0, true));
   });
 });
 
@@ -110,23 +136,23 @@ describe("a day is not started unless it can plausibly finish", () => {
   it("scales the start gate with the household, not a flat 4-member figure", () => {
     // Measured: three 5-member days began with ~205s against ~450s of work and
     // died having streamed ~25k tokens each — about $1.13 of a $3.28 run.
-    const gate5 = dayCallEstimateMs(bigCallTimeoutMs(5, true));
+    const gate5 = dayCallEstimateMs(bigCallTimeoutMs(5));
     expect(gate5).toBeGreaterThan(205_000);
     expect(DAY_CALL_ESTIMATE_MS).toBeLessThan(205_000); // …the old gate let them in
   });
 
   it("never demands the full worst-case ceiling, which would defer good days", () => {
     for (const n of [2, 4, 5, 6]) {
-      expect(dayCallEstimateMs(bigCallTimeoutMs(n, true)), `n=${n}`).toBeLessThan(
-        bigCallTimeoutMs(n, true),
+      expect(dayCallEstimateMs(bigCallTimeoutMs(n)), `n=${n}`).toBeLessThan(
+        bigCallTimeoutMs(n),
       );
     }
   });
 
   it("leaves a small household exactly as it was", () => {
     // 1-2 members: 0.6 × 240s is below the flat floor, so nothing changes.
-    expect(dayCallEstimateMs(bigCallTimeoutMs(1, false))).toBe(DAY_CALL_ESTIMATE_MS);
-    expect(dayCallEstimateMs(bigCallTimeoutMs(2, false))).toBe(DAY_CALL_ESTIMATE_MS);
+    expect(dayCallEstimateMs(bigCallTimeoutMs(1))).toBe(DAY_CALL_ESTIMATE_MS);
+    expect(dayCallEstimateMs(bigCallTimeoutMs(2))).toBe(DAY_CALL_ESTIMATE_MS);
   });
 
   it("does not make the phase-1 reserve pessimistic too", () => {
@@ -285,7 +311,7 @@ describe("rescueDaySlice", () => {
  */
 describe("the translation pass cannot outlive the invocation", () => {
   it("has a per-call ceiling far below a day call's", () => {
-    expect(TRANSLATE_CALL_TIMEOUT_MS).toBeLessThan(bigCallTimeoutMs(5, true));
+    expect(TRANSLATE_CALL_TIMEOUT_MS).toBeLessThan(bigCallTimeoutMs(5));
   });
 
   it("never lets a call run past the deadline, however little is left", () => {
@@ -326,7 +352,7 @@ describe("the translation pass cannot outlive the invocation", () => {
  */
 describe("a RETRY is held to the same bar as a first attempt", () => {
   it("costs the same scaled figure, not the bare viable floor", () => {
-    const cost = dayCallEstimateMs(bigCallTimeoutMs(5, true));
+    const cost = dayCallEstimateMs(bigCallTimeoutMs(5));
     // The gates now add `cost`; they used to add MIN_VIABLE_CALL_MS (45s) or a
     // flat 150s, either of which admits the 75-second call that was observed.
     expect(cost).toBeGreaterThan(75_446);
@@ -336,6 +362,6 @@ describe("a RETRY is held to the same bar as a first attempt", () => {
 
   it("still lets a small household retry freely", () => {
     // Two members: the scaled cost is the flat floor, so nothing tightened.
-    expect(dayCallEstimateMs(bigCallTimeoutMs(2, false))).toBe(DAY_CALL_ESTIMATE_MS);
+    expect(dayCallEstimateMs(bigCallTimeoutMs(2))).toBe(DAY_CALL_ESTIMATE_MS);
   });
 });

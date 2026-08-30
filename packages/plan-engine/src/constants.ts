@@ -120,14 +120,20 @@ export function skeletonMaxTokens(memberCount: number): number {
 
 /**
  * One day's expansion cap scaled to the members missing that day. Each member's
- * day is up to 4 full 8-field recipes; a housekeeper locale roughly doubles
- * per-meal output (translated name + ingredients + steps born in the same call).
- * Worst realistic case — 6 independent eaters + housekeeper translation — lands
- * near the 32000 ceiling; shared families collapse common dishes and sit well
- * under it. Solo (with or without translation) stays at the 12000 floor.
+ * day is up to 4 terse-keyed recipes (their OWN portion only — code builds the
+ * shared batch). Translation does NOT inflate this call: it left the day prompt
+ * on 07-24 (see the buildDayPrompt comment) and runs as the separate Haiku pass —
+ * the old `hasTranslation ? 4500 : 2600` branch here was a fossil of the inline
+ * era that only bought bigger caps and longer doomed calls.
+ *
+ * 3400/member is sized ABOVE the measured worst emission modes (pretty-printed
+ * JSON ≈17.5k tokens at 5 members, canonical-key disobedience 19-21k): a cap is
+ * billed only per real token, so generosity here is free, while a cap under the
+ * pretty mode makes every non-compact reply truncate into the doubled-cap retry.
+ * Tighten only after compact emission is proven ~100% across several runs.
  */
-export function dayMaxTokens(memberCount: number, hasTranslation: boolean): number {
-  const perMember = hasTranslation ? 4500 : 2600;
+export function dayMaxTokens(memberCount: number): number {
+  const perMember = 3400;
   return Math.min(
     MAX_OUTPUT_TOKENS,
     Math.max(DAY_MAX_TOKENS, 3000 + perMember * Math.max(1, memberCount)),
@@ -136,13 +142,16 @@ export function dayMaxTokens(memberCount: number, hasTranslation: boolean): numb
 
 /**
  * Wall-clock cap for ONE day/skeleton call, scaled to its size. The default
- * 4-min cap (anthropic.ts) aborts a legitimately large generation mid-stream; a
- * 6-member independent + translation day can emit ~32k tokens and take several
- * minutes. Capped at 10 min, safely under the 15-min function budget that
- * parallel days share.
+ * 4-min cap (anthropic.ts) aborts a legitimately large generation mid-stream.
+ * The translation branch (70s/member) is gone with the dayMaxTokens fossil —
+ * the day call has been Arabic-only since 07-24, and a ceiling is what a slow
+ * call expands to fill: at 5 members it granted 450s to ~200-250s of real work,
+ * which is exactly the doomed-call length that ate the run budget. 40s/member
+ * covers the measured worst mode (pretty-mode ~17.5k tokens at 65 tok/s ≈ 269s
+ * against the 360s ceiling at m=5) with margin.
  */
-export function bigCallTimeoutMs(memberCount: number, hasTranslation: boolean): number {
-  const perMember = hasTranslation ? 70_000 : 40_000;
+export function bigCallTimeoutMs(memberCount: number): number {
+  const perMember = 40_000;
   return Math.min(600_000, 240_000 + perMember * Math.max(0, memberCount - 2));
 }
 
@@ -191,9 +200,17 @@ const DAY_CONCURRENCY_OVERRIDE = (() => {
 })();
 
 export function dayConcurrency(memberCount: number, hasTranslation: boolean): number {
-  if (memberCount <= 3) return DAY_CONCURRENCY; // small families: calm sequential 1→7 fill
-  // Cap the parallel haiku burst so it stays under the day-model rate limit — 7
-  // simultaneous large calls reliably tripped 429s. Override via PLAN_DAY_CONCURRENCY.
+  if (memberCount <= 3) {
+    // The calm sequential 1→7 fill was a UX nicety small households could not
+    // actually afford: 7 sequential day calls exceed the run budget from 3
+    // members up (and from 2 with a housekeeper) — the budget table in
+    // dayBudget.test.ts is the arithmetic. 2/3/4 keeps the fill mostly ordered
+    // while making the week fit with re-roll headroom.
+    return DAY_CONCURRENCY_OVERRIDE ?? Math.max(DAY_CONCURRENCY, memberCount + 1);
+  }
+  // Cap the parallel burst so it stays under the day-model rate limit — 7
+  // simultaneous large calls reliably tripped 429s (measured on Haiku; untested
+  // on Sonnet). Override via PLAN_DAY_CONCURRENCY.
   return DAY_CONCURRENCY_OVERRIDE ?? (hasTranslation ? 5 : 4);
 }
 
