@@ -136,14 +136,20 @@ export function dayCallEstimateMs(perCallCeilingMs: number): number {
  * much or the household gets a fraction of its week no matter how healthy the
  * run looks.
  *
- * This is deliberately an ESTIMATE of a typical wave, not `bigCallTimeoutMs`'s
- * worst-case abort bound — reserving the worst case at five members would
- * exceed the entire function budget and leave the skeleton nothing, which is
- * the same failure pointing the other way.
+ * `perDayEstimateMs` must be the SAME figure the day loop's start gate demands
+ * (`dayCallEstimateMs` of this household's ceiling) — the two drifting apart is
+ * the all-defer inversion: phase 1 dutifully leaves waves × 150s while the gate
+ * demands waves × 300s, so every day is refused with the budget technically
+ * unspent. The default keeps legacy callers (and the flat small-household case)
+ * behaving as before; generate.ts passes the real gate figure.
  */
-export function dayLoopReserveMs(dayCount: number, concurrency: number): number {
+export function dayLoopReserveMs(
+  dayCount: number,
+  concurrency: number,
+  perDayEstimateMs: number = DAY_CALL_ESTIMATE_MS,
+): number {
   const waves = Math.ceil(Math.max(1, dayCount) / Math.max(1, concurrency));
-  return waves * DAY_CALL_ESTIMATE_MS;
+  return waves * Math.max(DAY_CALL_ESTIMATE_MS, perDayEstimateMs);
 }
 
 /**

@@ -70,6 +70,7 @@ import {
 import { isChildByAge } from "./childRule";
 import { riyadhTodayISO, khaleejiDayName } from "./dates";
 import { canonicalRecipeKey } from "./canonicalRecipeKey";
+import { captureToSentry } from "./sentryReport";
 
 // Accepts any Supabase client shape (cookie-typed or service-role admin).
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -288,24 +289,49 @@ export function retryWaitMs(attempt: number, retryAfterMs?: number): number {
 }
 
 /**
- * The representative cause for an all-days-failed throw: the most frequent per-day
- * error message (ties → earliest seen), truncated. Surfaces the true reason
- * (e.g. "Anthropic API 429: rate_limit_error…" or "Day N failed validation: …")
- * into meal_plans.error_message / the UI technical details / Sentry instead of a count.
+ * Collapse a per-day error message onto its CLASS, so counting can group what
+ * belongs together. The old summary took a plurality vote over EXACT strings —
+ * and the real failures each embed a unique day number or millisecond figure
+ * while deferrals share one constant string, so on the 08/30 run two free
+ * deferrals outvoted five paid truncations and a $4.16 run was recorded as
+ * "no model call made". Day indices, timing figures, and the salvage
+ * annotations (log detail, not class identity) are all stripped here.
  * Exported for unit testing.
+ */
+export function normalizeDayErrorClass(msg: string): string {
+  if (msg === BUDGET_DEFERRED_CAUSE) return "deferred (no model call)";
+  const m = msg.replace(/ \((?:no partial output|salvage:[^)]*)\)$/, "");
+  let x: RegExpMatchArray | null;
+  if ((x = m.match(/hit max_tokens \((\d+)\)/))) return `max_tokens(${x[1]})`;
+  if (/stream timeout/i.test(m)) return "stream timeout";
+  if (/stream error/i.test(m)) return "stream error";
+  if ((x = m.match(/Anthropic API (\d{3})/))) return `API ${x[1]}`;
+  if (/failed validation/.test(m)) return "schema validation failed";
+  if (/JSON parse|Unexpected token|Expected property|SyntaxError/i.test(m))
+    return "malformed JSON";
+  return m.replace(/^Day \d+ /, "").slice(0, 80);
+}
+
+/**
+ * The cause line for a partial or failed run: a CLASS HISTOGRAM of the per-day
+ * errors ("5x max_tokens(32000); 2x deferred (no model call)"), most frequent
+ * first, ties by first appearance. This is the only diagnostic that leaves the
+ * function (plan_generations.error_message), so it must survive a run whose
+ * every failure carries a unique string — the plurality vote it replaces did
+ * not. Exported for unit testing.
  */
 export function summarizeDayErrors(errors: string[]): string {
   if (errors.length === 0) return "";
   const counts = new Map<string, number>();
-  for (const e of errors) counts.set(e, (counts.get(e) ?? 0) + 1);
-  let best = "";
-  let bestN = 0;
-  for (const [msg, n] of counts)
-    if (n > bestN) {
-      best = msg;
-      bestN = n;
-    }
-  return best.slice(0, 300);
+  for (const e of errors) {
+    const k = normalizeDayErrorClass(e);
+    counts.set(k, (counts.get(k) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, n]) => `${n}x ${k}`)
+    .join("; ")
+    .slice(0, 300);
 }
 
 // A single day re-rolls this many times on a transient CONTENT failure before
@@ -1596,6 +1622,13 @@ export async function generateMealPlan(params: {
     );
   });
 
+  // Model-call census for this run (skeleton attempts + day calls). Recorded in
+  // missingDaysCause/error_message so a failed run's row answers "how many
+  // calls did this actually make?" — the 08/30 failure recorded "no model call
+  // made" for a run that made ~11, because the summary was a plurality vote
+  // and the census was nowhere.
+  let modelCallCount = 0;
+
   let skeleton: PlanSkeleton;
   if (needsSkeleton.length > 0) {
     const skeletonSystemPrompt = buildSkeletonPrompt(
@@ -1606,49 +1639,55 @@ export async function generateMealPlan(params: {
     // run (up to 6) emits a week of dish names per member and was truncating at
     // the old fixed 16000, which threw and failed the WHOLE generation.
     const skeletonCap = skeletonMaxTokens(needsSkeleton.length);
-    // Phase 1 must leave room for phase 2. `bigCallTimeoutMs` sizes this call to
-    // the WORK (280s at 3 members, up to ~600s for a large household) and knew
-    // nothing about the run deadline, and the truncation retry below can spend
-    // it a SECOND time. Free-access mode is what makes households that large
-    // reachable, since the tier cap no longer bounds member count.
-    //
-    // Clamping to the remaining budget alone is not enough: it stops the hard
-    // kill, but still allows the skeleton to consume every last millisecond and
-    // hand the day loop nothing. Measured in production on a 3-member household
-    // (Sentry bfda604f), twice, 430ms apart: 856s spent, zero days, every one of
-    // the 7 deferred with "run budget spent before this day started (no model
-    // call made)".
-    //
-    // Reserving ONE day call fixed that and was still wrong: it guarantees a
-    // single day could start, not that a WEEK can be built. Measured again at 5
-    // beneficiaries — one usable day for $2.81, six dying at a ~200s clamp
-    // against work that needs ~450s — because the skeleton was allowed to run
-    // until 150s remained. Two changes: the reserve is now the day loop's real
-    // shape (waves × a typical day), and the ceiling is sized to what a SKELETON
-    // writes rather than to a day of full recipes, since a ceiling is what a
-    // slow call expands to fill.
-    //
-    // Re-evaluated per attempt, so the truncation retry gets what is left rather
-    // than a stale figure computed before the first call.
+    // ── Phase 1 hard deadline ──
+    // The skeleton phase gets its OWN deadline, and can never touch what lies
+    // beyond it: the day loop's reserve, sized with the SAME per-day figure the
+    // day loop's start gate will demand (dayCallEstimateMs of this household's
+    // ceiling). Two production failures forced this shape:
+    //   - Sentry bfda604f: the skeleton ran to a ceiling that knew nothing
+    //     about the run deadline — 856s spent, zero days.
+    //   - 08/30 (plan b104d194): the reserve was sized with the flat 150s/wave
+    //     while the gate demanded ~300s/wave — phase 1 could dutifully respect
+    //     its reserve and STILL leave a budget every day call refused. All 7
+    //     deferred, "no model call made", $4.16. Reserve and gate now share one
+    //     figure, so "phase 1 fits" implies "the day loop can start" by
+    //     construction (pinned as a test invariant in dayBudget.test.ts).
+    const phase2DayCount =
+      familyDayIndices.length > 0 ? familyDayIndices.length : PLAN_WEEK_DAYS;
+    // Phase 2's own concurrency, recomputed here rather than read from
+    // `dayLoopConcurrency` (declared after this block). Worst-case member count
+    // for the gate figure: a reserve sized to a smaller day than the loop will
+    // actually run recreates the inversion.
+    const phase2GateMs = dayCallEstimateMs(bigCallTimeoutMs(beneficiaries.length));
+    const phase1DeadlineMs =
+      deadlineMs == null
+        ? undefined
+        : deadlineMs -
+          dayLoopReserveMs(
+            phase2DayCount,
+            dayConcurrency(beneficiaries.length, !!context.housekeeper_locale),
+            phase2GateMs,
+          );
+    const skeletonCeiling = skeletonTimeoutMs(needsSkeleton.length);
+    // No MIN_VIABLE floor here — flooring is how a doomed call starts. An
+    // attempt gets the room phase 1 actually has; whether that room is worth an
+    // attempt at all is skeletonAttemptViable's decision.
     const skeletonTimeoutFor = (): number =>
-      Math.max(
-        MIN_VIABLE_CALL_MS,
-        Math.min(
-          skeletonTimeoutMs(needsSkeleton.length),
-          remainingMs(deadlineMs) -
-            // The day grid is the carried family's when there is one, else the
-            // week the skeleton is about to lay out.
-            dayLoopReserveMs(
-              familyDayIndices.length > 0 ? familyDayIndices.length : PLAN_WEEK_DAYS,
-              // Phase 2's own concurrency, recomputed here rather than read from
-              // `dayLoopConcurrency` — that is declared after this block, and a
-              // reserve computed from the wrong wave count is the bug this is
-              // fixing. `context.housekeeper_locale` is the same input phase 2
-              // derives `hasTranslation` from.
-              dayConcurrency(beneficiaries.length, !!context.housekeeper_locale),
-            ),
-        ),
+      Math.min(skeletonCeiling, remainingMs(phase1DeadlineMs));
+    // An attempt (first or retry) is refused outright when phase 1 has less
+    // than 0.6× the skeleton's ceiling left — below that, the call is being
+    // started on hope. A refused first attempt fails the run honestly (the
+    // retry card, a fresh dispatch, a full budget); a refused retry hands the
+    // failure to the caller with the budget for the day loop INTACT. At 5-6
+    // members + housekeeper this leaves roughly one attempt's window (~180s) —
+    // accepted explicitly until Stage 2 shrinks day emissions and widens it.
+    const skeletonAttemptViable = (waitMs: number) =>
+      canFit(phase1DeadlineMs, waitMs + Math.round(skeletonCeiling * 0.6));
+    if (!skeletonAttemptViable(0)) {
+      throw new PlanValidationError(
+        `Phase 1 refused: ${Math.round(remainingMs(phase1DeadlineMs) / 1000)}s left before the day-loop reserve, skeleton needs ~${Math.round((skeletonCeiling * 0.6) / 1000)}s`,
       );
+    }
     const runSkeleton = (maxTokens: number) =>
       streamAnthropic({
         apiKey: anthropicApiKey,
@@ -1661,14 +1700,10 @@ export async function generateMealPlan(params: {
     // The skeleton is the run's single point of failure and it used to be the
     // only call with NO retry of any kind (except max_tokens): every day call
     // gets 5 API retries + 2 content re-rolls, while one 429 or one malformed
-    // reply on this call failed the WHOLE generation. Same discipline now, one
-    // gate: a retry must leave room for the retry call itself plus at least one
-    // day call. Deliberately NOT the full day-loop reserve — dayLoopReserveMs
-    // at small-household concurrency exceeds the entire budget (the same
-    // degeneration that clamps skeletonTimeoutFor to its floor), which would
-    // make this discipline dead code exactly where the skeleton matters most.
-    const skeletonRetryFits = (waitMs: number) =>
-      canFit(deadlineMs, waitMs + MIN_VIABLE_CALL_MS + DAY_CALL_ESTIMATE_MS);
+    // reply on this call failed the WHOLE generation. Same discipline now,
+    // bounded by phase 1's own deadline — a retry can burn skeleton budget,
+    // never day-loop budget.
+    const skeletonRetryFits = skeletonAttemptViable;
     let sk: StreamResult;
     let skApiAttempt = 0;
     let skContentRetried = false; // one fresh re-roll on malformed/schema-miss
@@ -1676,6 +1711,7 @@ export async function generateMealPlan(params: {
     let skCap = skeletonCap;
     for (;;) {
       try {
+        modelCallCount++;
         sk = await runSkeleton(skCap);
       } catch (err) {
         // The dead call was billed for what it streamed even though it never
@@ -1707,7 +1743,13 @@ export async function generateMealPlan(params: {
       }
       totalIn += sk.tokensIn;
       totalOut += sk.tokensOut;
-      totalCost += computeCostUsd(sk.tokensIn, sk.tokensOut, SKELETON_MODEL);
+      totalCost += computeCostUsd(
+        sk.tokensIn,
+        sk.tokensOut,
+        SKELETON_MODEL,
+        sk.cacheCreationTokens,
+        sk.cacheReadTokens,
+      );
       publishUsage();
       // A truncated skeleton (stop_reason=max_tokens) yields invalid JSON and
       // kills the whole generation. Retry ONCE at double the cap (clamped to
@@ -1738,6 +1780,30 @@ export async function generateMealPlan(params: {
             sk.text,
           );
         skeleton = r.data;
+        // PlanSkeletonSchema requires members.min(1), so a skeleton that
+        // silently DROPPED members still validates — downstream then hands the
+        // missing members fallback targets (zero macros) without a word said
+        // anywhere. Observed on the 08/30 run: two of five members shipped
+        // zero-macro shells. Not repaired here (the drain/chain refill them),
+        // but never silent again.
+        {
+          const returned = new Set(skeleton.members.map((m) => m.member_id));
+          const dropped = needsSkeleton
+            .filter((b) => !returned.has(b.member_id))
+            .map((b) => b.member_id);
+          if (dropped.length > 0) {
+            console.warn(
+              "[plan-generate] skeleton dropped member(s):",
+              dropped.join(", "),
+            );
+            void captureToSentry(
+              new Error(
+                `skeleton dropped ${dropped.length} of ${needsSkeleton.length} member(s)`,
+              ),
+              { step: "skeleton-dropped-member" },
+            ).catch(() => {});
+          }
+        }
         break;
       } catch (e) {
         const wrapped =
@@ -2155,18 +2221,25 @@ export async function generateMealPlan(params: {
               tokensOut: 0,
               stopReason: "salvaged",
             }
-          : await streamAnthropic({
+          : (modelCallCount++,
+            await streamAnthropic({
               apiKey: anthropicApiKey,
               model: DAY_MODEL,
               maxTokens: dayCap,
               systemStatic: STATIC_SYSTEM,
               systemPrompt: prompt,
               timeoutMs: callTimeout(),
-            });
+            }));
         salvagedSlice = null;
         totalIn += res.tokensIn;
         totalOut += res.tokensOut;
-        totalCost += computeCostUsd(res.tokensIn, res.tokensOut, DAY_MODEL);
+        totalCost += computeCostUsd(
+          res.tokensIn,
+          res.tokensOut,
+          DAY_MODEL,
+          res.cacheCreationTokens,
+          res.cacheReadTokens,
+        );
         publishUsage();
         if (res.stopReason === "max_tokens") {
           // Truncated. Re-rolling at the same cap will truncate again — retry once
@@ -2590,16 +2663,27 @@ export async function generateMealPlan(params: {
           }
         }
         // (3) Out of retries. Before losing the day entirely, see whether the
-        // stream that died had already written whole members. Six day calls
-        // streamed ~25k tokens apiece and were discarded whole on the run that
-        // motivated this — the tokens are paid for either way, and most of them
-        // describe finished recipes.
-        if (!salvageTried && err instanceof AnthropicCallError && err.partialText) {
+        // reply that died had already written whole members. TWO ways a day
+        // reaches here with most of its tokens already paid for: a stream that
+        // died mid-body (AnthropicCallError.partialText), and a reply that hit
+        // its token cap (the max_tokens throw above — a COMPLETE stream whose
+        // JSON is merely cut short; PlanValidationError.rawResponse carries
+        // it). The 08/30 run threw away ~$3 of the second kind because this
+        // gate only accepted the first: five days truncated at the cap and
+        // every one was discarded whole.
+        const salvageableText =
+          err instanceof AnthropicCallError
+            ? err.partialText
+            : err instanceof PlanValidationError &&
+                /hit max_tokens/.test(err.message)
+              ? err.rawResponse
+              : undefined;
+        if (!salvageTried && salvageableText) {
           salvageTried = true;
-          const rescued = rescueDaySlice(err.partialText, daySkeleton, dayIndex);
+          const rescued = rescueDaySlice(salvageableText, daySkeleton, dayIndex);
           if (rescued) {
             console.warn(
-              `[plan-generate] day ${dayIndex} rescued from a timed-out stream:`,
+              `[plan-generate] day ${dayIndex} rescued from a ${err instanceof AnthropicCallError ? "dead stream" : "truncated reply"}:`,
               rescued.members.map((m) => m.member_id).join(", "),
             );
             salvagedSlice = rescued;
@@ -2615,13 +2699,14 @@ export async function generateMealPlan(params: {
         // measurement unreadable: "no complete member" was also what a stream
         // that never finished a single element reported, which points at a
         // completely different fix (call length, not match strictness).
-        const msg = !(err instanceof AnthropicCallError)
-          ? base
-          : !err.partialText
+        // summarizeDayErrors strips these annotations when it groups classes,
+        // so they cost nothing in the histogram and remain in the logs.
+        const msg =
+          err instanceof AnthropicCallError && !err.partialText
             ? `${base} (no partial output)`
-            : !salvageTried
+            : !salvageableText || !salvageTried
               ? base
-              : salvageTruncatedJson(err.partialText) == null
+              : salvageTruncatedJson(salvageableText) == null
                 ? `${base} (salvage: nothing whole streamed)`
                 : `${base} (salvage: no complete member)`;
         console.error("[plan-generate] day failed (omitting)", dayIndex, msg);
@@ -2669,7 +2754,7 @@ export async function generateMealPlan(params: {
   if (done.size === 0 && nothingCarried) {
     const cause = summarizeDayErrors(dayErrors);
     throw new PlanValidationError(
-      `All ${genDayCount} day generations failed${cause ? ` — ${cause}` : ""}`,
+      `All ${genDayCount} day generations failed${cause ? ` — ${cause}` : ""} [${modelCallCount} model call${modelCallCount === 1 ? "" : "s"}]`,
     );
   }
 
@@ -2817,7 +2902,14 @@ export async function generateMealPlan(params: {
       cost_usd: totalCost,
     },
     missingDays: [...failedDays].sort((a, b) => a - b),
-    missingDaysCause: summarizeDayErrors(dayErrors),
+    // The class histogram plus the run's call census — together they answer
+    // "what killed the days, and did the worker actually work?" from the row
+    // alone. The census is what exposed the 08/30 lie ("no model call made"
+    // on a run that made ~11).
+    missingDaysCause:
+      dayErrors.length > 0
+        ? `${summarizeDayErrors(dayErrors)} [${modelCallCount} model call${modelCallCount === 1 ? "" : "s"}]`
+        : "",
     daysCompleted: done.size,
   };
 }
@@ -3164,6 +3256,8 @@ export async function translateMealPlan(params: {
     boundedCallTimeoutMs(TRANSLATE_CALL_TIMEOUT_MS, deadlineMs);
   let totalIn = 0;
   let totalOut = 0;
+  let totalCacheCreation = 0;
+  let totalCacheRead = 0;
 
   // Deep-clone the parts we mutate so the caller's object is untouched.
   const members: MemberPlan[] = plan.members.map((m) => ({
@@ -3219,6 +3313,8 @@ export async function translateMealPlan(params: {
           });
           totalIn += res.tokensIn;
           totalOut += res.tokensOut;
+          totalCacheCreation += res.cacheCreationTokens ?? 0;
+          totalCacheRead += res.cacheReadTokens ?? 0;
           if (res.stopReason === "max_tokens")
             throw new PlanValidationError("Name translate hit max_tokens", res.text);
           const parsed = NameTranslateOutSchema.safeParse(
@@ -3297,6 +3393,8 @@ export async function translateMealPlan(params: {
           });
           totalIn += res.tokensIn;
           totalOut += res.tokensOut;
+          totalCacheCreation += res.cacheCreationTokens ?? 0;
+          totalCacheRead += res.cacheReadTokens ?? 0;
           if (res.stopReason === "max_tokens")
             throw new PlanValidationError(
               `Translate ${member.member_id} day ${dayIndex} hit max_tokens`,
@@ -3365,7 +3463,7 @@ export async function translateMealPlan(params: {
     usage: {
       input_tokens: totalIn,
       output_tokens: totalOut,
-      cost_usd: computeCostUsd(totalIn, totalOut, TRANSLATE_MODEL),
+      cost_usd: computeCostUsd(totalIn, totalOut, TRANSLATE_MODEL, totalCacheCreation, totalCacheRead),
       model: TRANSLATE_MODEL,
     },
   };

@@ -26,6 +26,7 @@ import {
 } from "./budget";
 import {
   bigCallTimeoutMs,
+  dayMaxTokens,
   skeletonTimeoutMs,
   dayConcurrency,
   TRANSLATE_CALL_TIMEOUT_MS,
@@ -88,6 +89,39 @@ describe("the skeleton's ceiling tracks the skeleton's own work", () => {
 
   it("still gives a solo household a workable phase 1", () => {
     expect(skeletonTimeoutMs(1)).toBeGreaterThan(120_000);
+  });
+});
+
+describe("the phase-1 reserve and the day start gate share one figure", () => {
+  // The 08/30 all-defer inversion: the reserve was waves x a FLAT 150s while
+  // the gate demanded waves x 0.6x-ceiling (~300s at 5 members), so phase 1
+  // could dutifully respect its reserve and still leave a budget every single
+  // day call refused — all 7 deferred, "no model call made", $4.16. The
+  // invariant: at every household size, the reserve per wave covers the gate.
+  it("reserve per wave ≥ the start gate, for every household size", () => {
+    for (const m of [1, 2, 3, 4, 5, 6]) {
+      const gate = dayCallEstimateMs(bigCallTimeoutMs(m));
+      for (const hasTranslation of [true, false]) {
+        const conc = dayConcurrency(m, hasTranslation);
+        const waves = Math.ceil(PLAN_WEEK_DAYS / conc);
+        const reserve = dayLoopReserveMs(PLAN_WEEK_DAYS, conc, gate);
+        expect(reserve / waves, `m=${m} translation=${hasTranslation}`).toBeGreaterThanOrEqual(gate);
+      }
+    }
+  });
+
+  it("cap and ceiling stay consistent: a full-cap emission fits its own ceiling at the worst measured rate", () => {
+    // The other half of the 08/30 failure: a 360s ceiling under a cap whose
+    // honest emission needs ~400s guaranteed the doubled-cap retry died.
+    for (const m of [1, 2, 3, 4, 5, 6]) {
+      const secondsForFullCap = dayMaxTokens(m) / 65;
+      expect(bigCallTimeoutMs(m) / 1000, `m=${m}`).toBeGreaterThanOrEqual(secondsForFullCap);
+    }
+  });
+
+  it("the cap clears every emission mode ever measured at 5 members", () => {
+    // compact ~10k, pretty ~17.5k, disobedience 19-21k, the 08/30 run ≥26k.
+    expect(dayMaxTokens(5)).toBeGreaterThanOrEqual(26_000);
   });
 });
 

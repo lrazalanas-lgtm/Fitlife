@@ -10,6 +10,7 @@ import { streamAnthropic } from "./anthropic";
 import {
   generateMealPlan,
   summarizeDayErrors,
+  BUDGET_DEFERRED_CAUSE,
   retryWaitMs,
   isTransientContentError,
 } from "./generate";
@@ -131,16 +132,43 @@ describe("summarizeDayErrors", () => {
   it("returns empty string for no errors", () => {
     expect(summarizeDayErrors([])).toBe("");
   });
-  it("returns the single error", () => {
-    expect(summarizeDayErrors(["boom"])).toBe("boom");
+  it("counts the single error as a class", () => {
+    expect(summarizeDayErrors(["boom"])).toBe("1x boom");
   });
-  it("returns the most frequent error (ties → earliest seen)", () => {
-    expect(summarizeDayErrors(["a", "b", "a"])).toBe("a");
-    expect(summarizeDayErrors(["x", "y"])).toBe("x"); // tie → first
+  it("histograms by frequency (ties → earliest seen)", () => {
+    expect(summarizeDayErrors(["a", "b", "a"])).toBe("2x a; 1x b");
+    expect(summarizeDayErrors(["x", "y"])).toBe("1x x; 1x y"); // tie → first-seen order
   });
-  it("truncates to 300 chars", () => {
+  it("clips unknown classes and bounds the whole line", () => {
     const long = "z".repeat(500);
-    expect(summarizeDayErrors([long])).toHaveLength(300);
+    const out = summarizeDayErrors([long]);
+    expect(out.startsWith("1x zzz")).toBe(true);
+    expect(out.length).toBeLessThanOrEqual(300);
+  });
+  it("groups unique per-day strings onto one class — deferrals can never outvote paid deaths", () => {
+    // THE 08/30 failure: five truncations each carried a unique day number, two
+    // deferrals shared one constant string, and the plurality vote over exact
+    // strings recorded a $4.16 run as "no model call made".
+    const errors = [
+      "Day 0 hit max_tokens (32000)",
+      "Day 2 hit max_tokens (32000) (salvage: no complete member)",
+      "Day 3 hit max_tokens (32000)",
+      "Day 4 hit max_tokens (32000) (salvage: nothing whole streamed)",
+      "Day 5 hit max_tokens (32000)",
+      BUDGET_DEFERRED_CAUSE,
+      BUDGET_DEFERRED_CAUSE,
+    ];
+    expect(summarizeDayErrors(errors)).toBe(
+      "5x max_tokens(32000); 2x deferred (no model call)",
+    );
+  });
+  it("strips day indices and timing figures from stream errors", () => {
+    expect(
+      summarizeDayErrors([
+        "Anthropic stream timeout after 75446ms",
+        "Anthropic stream timeout after 204968ms",
+      ]),
+    ).toBe("2x stream timeout");
   });
 });
 
@@ -194,7 +222,10 @@ describe("generateMealPlan — surfaces the real cause when all days fail", () =
     expect(err).toBeInstanceOf(PlanValidationError);
     const message = (err as Error).message;
     expect(message).toMatch(/All 3 day generations failed/);
-    expect(message).toMatch(/SURFACED_CAUSE_MARKER/);
+    // Class-normalized: the status code survives (the diagnosis), the response
+    // body does not — and the census says how many calls actually happened.
+    expect(message).toMatch(/API 400/);
+    expect(message).toMatch(/\[\d+ model calls?\]/);
   });
 });
 
@@ -331,6 +362,48 @@ describe("generateMealPlan — Part F: in-run second-chance pass", () => {
     const mom = plan.members.find((m) => m.member_id === "mom")!;
     expect(mom.days.find((d) => d.day_index === 1)!.meals.length).toBeGreaterThan(0);
   }, 20000);
+});
+
+describe("generateMealPlan — Part G: a truncated day is salvaged, not discarded", () => {
+  it("rescues the complete members from a reply that hit max_tokens twice", async () => {
+    // THE 08/30 money pit: a day that truncated at its cap was thrown away
+    // WHOLE — 20-32k billed tokens per day — because truncation raises
+    // PlanValidationError and the salvage gate only accepted
+    // AnthropicCallError. The truncated text is a COMPLETE stream (the JSON is
+    // merely cut short), so the whole-member rescue applies to it exactly as
+    // it does to a dead stream.
+    const wholeSlice = JSON.stringify({
+      day_index: 1,
+      members: [{ member_id: "mom", meals: [validMeal("mom-d1-salvaged")] }],
+    });
+    const truncated = wholeSlice.slice(0, wholeSlice.length - 2); // cut mid-structure
+    let day1Calls = 0;
+    mockedStream.mockImplementation(async (params) => {
+      const systemPrompt =
+        (params as { systemPrompt?: string } | undefined)?.systemPrompt ?? "";
+      if (!/day_index=\d+/.test(systemPrompt)) return skeletonResponse();
+      if (/day_index=1\b/.test(systemPrompt)) {
+        day1Calls++;
+        // Truncates on the initial call AND the doubled-cap retry.
+        return { text: truncated, tokensIn: 5, tokensOut: 5, stopReason: "max_tokens" };
+      }
+      return validDayResponse(systemPrompt);
+    });
+
+    const { plan, missingDays, missingDaysCause } = await generateMealPlan({
+      anthropicApiKey: "test-key",
+      context: makeSoloContext(),
+    });
+
+    // Two paid calls (initial + doubled retry) — the salvage itself is free.
+    expect(day1Calls).toBe(2);
+    expect(missingDays).not.toContain(1);
+    expect(missingDaysCause ?? "").toBe("");
+    const mom = plan.members.find((m) => m.member_id === "mom")!;
+    const day1 = mom.days.find((d) => d.day_index === 1)!;
+    expect(day1.meals.length).toBeGreaterThan(0);
+    expect(day1.meals[0]!.recipe_name_ar).toBe("mom-d1-salvaged");
+  });
 });
 
 describe("DAY_MODEL default", () => {

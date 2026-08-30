@@ -1037,3 +1037,40 @@ compact emission ≈100%; only then tighten `dayMaxTokens` toward 2600/member. G
 old sequential cliff could NOT fit and the new 2/3/4 fill can) + `skeletonBudget.test.ts`;
 the bg function remains a mirror — **when changing `runMealPlanGeneration` or the engine's
 retry/budget behavior, check generate-plan-background.mts: it is the production path.**
+
+**Stage 1 of the delivery plan (08/30/2026): the $4.16-for-zero-days class is closed.**
+The first calibration run after the Stage 0+1 rebuild failed by CAP ARITHMETIC, not
+model behavior: the day cap (20k) sat INSIDE the measured emission band (19-26k), so
+every day call truncated at the cap, billed in full, then burned a doomed doubled-cap
+retry under a ceiling too short for it — and the error summary's plurality vote over
+EXACT strings let 2 free deferrals outvote 5 paid deaths ("no model call made" on a run
+that made ~11). Five fixes, one deploy: (1) `dayMaxTokens` = 3000+**5800**/member (32k
+at 5 members — above every measured mode; a cap bills only real tokens) and
+`bigCallTimeoutMs` DERIVED from the cap (cap/65 tok/s + 20s TTFT ≈ 512s @5) so the pair
+cannot drift apart again — pinned by a dayBudget.test invariant. (2) The salvage gate
+accepts TRUNCATION throws (`PlanValidationError.rawResponse` on /hit max_tokens/), not
+only dead streams — a twice-truncated day is rescued member-by-member instead of
+discarding 20-32k billed tokens. (3) **Phase-1 hard deadline**: run deadline minus
+`dayLoopReserveMs(days, conc, dayCallEstimateMs(bigCallTimeoutMs(m)))` — the reserve
+now uses THE SAME per-day figure as the day loop's start gate (their drift was the
+all-defer inversion); no 45s floor; an attempt (first or retry) is REFUSED below 0.6×
+the skeleton ceiling (`Phase 1 refused` before any model call, $0). At 5-6 members +
+maid this leaves ~180s of skeleton window — single-attempt-then-retry-card, accepted
+until Stage 2 shrinks emissions. (4) `summarizeDayErrors` is a normalized CLASS
+HISTOGRAM ("5x max_tokens(32000); 2x deferred (no model call)") + a model-call census
+`[N model calls]` on missingDaysCause and the all-days-failed throw
+(`normalizeDayErrorClass` strips day indices/ms figures/salvage annotations). (5) Cost
+honesty: `StreamResult` carries `cacheCreationTokens`/`cacheReadTokens` (message_start),
+`computeCostUsd` prices them (1.25×/0.1× input rate — recorded costs rise ~10-30%, that
+traffic was always billed and never recorded); dead streams prefer a real usage figure
+over the 0.6 tok/byte estimate; `PRICING_USD_PER_MTOK_BY_MODEL` fixed (opus-4-7 was CUT
+to $5/$25 — verified against current docs 08/2026; sonnet-5 $2/$10 and opus-5 added)
+and the bg function warns when an env-pointed model id has no pricing entry
+(`isKnownPricingModel`) since the conservative fallback over-reports up to ~7.5×. Plus:
+a skeleton that silently DROPS members (schema min(1) tolerates it; produced the 08/30
+zero-macro shells) now warns to Sentry. Guarded by the reworked deadline.test.ts (the
+"skeleton alone consumed the budget" scenario is now IMPOSSIBLE and its test asserts
+the refusal instead), dayFailure.test Part G (truncation salvage), and the dayBudget
+reserve≥gate + cap≤ceiling invariants. NOTE: deadline.test fixtures assume the solo
+phase-1 floor (~690s = 4 waves × 150s + 0.6×150s) — a synthetic deadline below it now
+refuses phase 1 up front, by design.

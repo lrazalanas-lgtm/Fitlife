@@ -43,7 +43,13 @@ import {
   shouldChainContinuation,
   PLAN_CHAIN_MAX_HOPS,
 } from "../../../../packages/plan-engine/src/chain";
-import { planModelLabel } from "../../../../packages/plan-engine/src/constants";
+import {
+  planModelLabel,
+  isKnownPricingModel,
+  SKELETON_MODEL,
+  DAY_MODEL,
+  TRANSLATE_MODEL,
+} from "../../../../packages/plan-engine/src/constants";
 import { isChildByAge } from "../../../../packages/plan-engine/src/childRule";
 // Error reporting over plain fetch — @sentry/* cannot be bundled here for the
 // same reason @supabase/supabase-js cannot (see the note above). Without this
@@ -675,6 +681,18 @@ const handler = async (req: Request): Promise<Response> => {
       { step: "bg-env-gate", tags: { missing: missingEnv.join(",") } },
     );
     return new Response("Server misconfigured", { status: 500 });
+  }
+  // An env-pointed model id outside the pricing table doesn't fail anything —
+  // it silently prices every run at the conservative fallback (up to ~7.5x
+  // over-reported), corrupting the exact spend gauges the model-ladder
+  // decisions are read from. Loud, once per invocation, never fatal.
+  for (const m of new Set([SKELETON_MODEL, DAY_MODEL, TRANSLATE_MODEL])) {
+    if (!isKnownPricingModel(m)) {
+      console.warn(
+        "[generate-plan-background] model id has no pricing entry — cost_usd will be over-reported at fallback rates:",
+        m,
+      );
+    }
   }
   if (
     !expected ||

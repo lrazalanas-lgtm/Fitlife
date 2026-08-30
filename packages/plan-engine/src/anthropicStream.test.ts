@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { streamAnthropic } from "./anthropic";
+import { streamAnthropic, computeCostUsd } from "./anthropic";
 import { AnthropicCallError } from "./errors";
 import { isRetryable } from "./generate";
 
@@ -85,6 +85,46 @@ describe("the happy path", () => {
     // rejects a trailing assistant turn outright (API 400, measured on prod).
     const messages = sentBody.messages as Array<{ role: string }>;
     expect(messages[messages.length - 1]!.role).toBe("user");
+  });
+});
+
+describe("cache traffic is real money", () => {
+  it("surfaces cache tokens from message_start and prices them", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        sseResponse([
+          sseEvent({
+            type: "message_start",
+            message: {
+              usage: {
+                input_tokens: 100,
+                cache_creation_input_tokens: 2000,
+                cache_read_input_tokens: 30000,
+              },
+            },
+          }),
+          delta("ok"),
+          messageDelta,
+        ]),
+      ),
+    );
+    const res = await streamAnthropic({
+      apiKey: "k",
+      model: "m",
+      maxTokens: 100,
+      systemPrompt: "s",
+    });
+    expect(res.cacheCreationTokens).toBe(2000);
+    expect(res.cacheReadTokens).toBe(30000);
+  });
+
+  it("computeCostUsd prices writes at 1.25x and reads at 0.1x the input rate", () => {
+    // Sonnet 4.6: $3/M input → writes $3.75/M, reads $0.30/M.
+    expect(computeCostUsd(0, 0, "claude-sonnet-4-6", 1_000_000, 0)).toBeCloseTo(3.75, 6);
+    expect(computeCostUsd(0, 0, "claude-sonnet-4-6", 0, 1_000_000)).toBeCloseTo(0.3, 6);
+    // And omitting them keeps every legacy call site's arithmetic identical.
+    expect(computeCostUsd(1_000_000, 1_000_000, "claude-sonnet-4-6")).toBeCloseTo(18, 6);
   });
 });
 

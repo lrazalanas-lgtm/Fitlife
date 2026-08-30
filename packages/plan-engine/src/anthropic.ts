@@ -6,6 +6,13 @@ export interface StreamResult {
   tokensIn: number;
   tokensOut: number;
   stopReason: string | null;
+  // Prompt-cache traffic from message_start. Billed at 1.25x (writes) and 0.1x
+  // (reads) of the input rate — real money that was NEVER in the recorded
+  // cost, so every audit figure was a floor. Optional so the many test mocks
+  // (and older call sites) need no change; computeCostUsd prices them when
+  // callers pass them through.
+  cacheCreationTokens?: number;
+  cacheReadTokens?: number;
 }
 
 /**
@@ -127,12 +134,17 @@ export async function streamAnthropic(params: {
     let streamedAny = false;
     let tokensIn = 0;
     let tokensOut = 0;
+    let cacheCreation = 0;
+    let cacheRead = 0;
     let stopReason: string | null = null;
 
-    // What a dead call was billed for its output, from the streamed bytes.
-    // 0.6 tok/byte is the measured compact-mode figure (pretty mode runs ~0.97);
-    // an estimate marked as such beats recording 0 for a call that billed 25k.
+    // What a dead call was billed for its output. A real usage figure (a
+    // message_delta that arrived before the death) always beats the estimate;
+    // failing that, 0.6 tok/byte over the streamed bytes (the measured
+    // compact-mode figure; pretty mode runs ~0.97). An estimate marked as such
+    // beats recording 0 for a call that billed 25k.
     const estimatedStreamedTokens = (): number | undefined => {
+      if (tokensOut > 0) return tokensOut;
       if (!streamedAny) return undefined;
       const streamedBytes = new TextEncoder().encode(text).length;
       return Math.max(1, Math.round(streamedBytes * 0.6));
@@ -167,9 +179,19 @@ export async function streamAnthropic(params: {
           switch (evt.type) {
             case "message_start": {
               const usage = (
-                evt.message as { usage?: { input_tokens?: number } }
+                evt.message as {
+                  usage?: {
+                    input_tokens?: number;
+                    cache_creation_input_tokens?: number;
+                    cache_read_input_tokens?: number;
+                  };
+                }
               )?.usage;
               if (usage?.input_tokens != null) tokensIn = usage.input_tokens;
+              if (usage?.cache_creation_input_tokens != null)
+                cacheCreation = usage.cache_creation_input_tokens;
+              if (usage?.cache_read_input_tokens != null)
+                cacheRead = usage.cache_read_input_tokens;
               break;
             }
             case "content_block_delta": {
@@ -238,7 +260,14 @@ export async function streamAnthropic(params: {
       );
     }
 
-    return { text, tokensIn, tokensOut, stopReason };
+    return {
+      text,
+      tokensIn,
+      tokensOut,
+      stopReason,
+      cacheCreationTokens: cacheCreation,
+      cacheReadTokens: cacheRead,
+    };
   } finally {
     clearTimeout(timer);
   }
@@ -369,13 +398,24 @@ export function salvageTruncatedJson(text: string): string | null {
   return cut === -1 ? null : trimmed.slice(start, cut) + closers;
 }
 
+/**
+ * Cache traffic prices off the INPUT rate: writes at 1.25x, reads at 0.1x.
+ * The optional params keep every legacy call site compiling, but a caller that
+ * has the cache figures and drops them is under-reporting — measured, cache
+ * traffic was 10-30% of a generation's real bill and none of it was recorded.
+ */
 export function computeCostUsd(
   tokensIn: number,
   tokensOut: number,
   model: string,
+  cacheCreationTokens = 0,
+  cacheReadTokens = 0,
 ): number {
   const rate = pricingForModel(model);
   const cost =
-    (tokensIn / 1_000_000) * rate.input + (tokensOut / 1_000_000) * rate.output;
+    (tokensIn / 1_000_000) * rate.input +
+    (tokensOut / 1_000_000) * rate.output +
+    (cacheCreationTokens / 1_000_000) * rate.input * 1.25 +
+    (cacheReadTokens / 1_000_000) * rate.input * 0.1;
   return Math.round(cost * 1_000_000) / 1_000_000;
 }

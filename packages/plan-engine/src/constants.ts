@@ -54,11 +54,22 @@ export const PRICING_USD_PER_MTOK_BY_MODEL: Record<
   string,
   { input: number; output: number }
 > = {
-  "claude-opus-4-7": { input: 15, output: 75 },
+  // Verified against docs.claude.com pricing 08/2026. Opus 4.7 was CUT to
+  // $5/$25 after the 2026-05 figure this table originally locked ($15/$75) —
+  // a stale row here silently over-reports audit cost 3x for any run pointed
+  // at it, which is how the fallback below misled too.
+  "claude-opus-4-7": { input: 5, output: 25 },
+  "claude-opus-5": { input: 5, output: 25 },
+  "claude-sonnet-5": { input: 2, output: 10 },
   "claude-sonnet-4-6": { input: 3, output: 15 },
   "claude-haiku-4-5-20251001": { input: 1, output: 5 },
+  "claude-haiku-4-5": { input: 1, output: 5 },
 };
 
+// Deliberately above every real rate so an unknown id can never UNDER-report
+// spend — but a run priced by this row is mis-audited by up to ~7.5x, so an
+// unknown id is a loud misconfiguration, not a quiet fallback. Callers that
+// configure models from env should check isKnownPricingModel and warn.
 const FALLBACK_PRICING = { input: 15, output: 75 } as const;
 
 export function pricingForModel(model: string): {
@@ -66,6 +77,17 @@ export function pricingForModel(model: string): {
   output: number;
 } {
   return PRICING_USD_PER_MTOK_BY_MODEL[model] ?? FALLBACK_PRICING;
+}
+
+/**
+ * Whether cost accounting has a real rate for this model id. False means every
+ * cost_usd written for the run is the conservative fallback (over-reported up
+ * to ~7.5x) — the background function warns at invocation so an env-pointed
+ * model id outside this table cannot silently corrupt the spend gauges the
+ * pricing decisions are read from.
+ */
+export function isKnownPricingModel(model: string): boolean {
+  return model in PRICING_USD_PER_MTOK_BY_MODEL;
 }
 
 /**
@@ -122,18 +144,19 @@ export function skeletonMaxTokens(memberCount: number): number {
  * One day's expansion cap scaled to the members missing that day. Each member's
  * day is up to 4 terse-keyed recipes (their OWN portion only — code builds the
  * shared batch). Translation does NOT inflate this call: it left the day prompt
- * on 07-24 (see the buildDayPrompt comment) and runs as the separate Haiku pass —
- * the old `hasTranslation ? 4500 : 2600` branch here was a fossil of the inline
- * era that only bought bigger caps and longer doomed calls.
+ * on 07-24 and runs as the separate Haiku pass.
  *
- * 3400/member is sized ABOVE the measured worst emission modes (pretty-printed
- * JSON ≈17.5k tokens at 5 members, canonical-key disobedience 19-21k): a cap is
- * billed only per real token, so generosity here is free, while a cap under the
- * pretty mode makes every non-compact reply truncate into the doubled-cap retry.
- * Tighten only after compact emission is proven ~100% across several runs.
+ * 5800/member puts the cap ABOVE every emission mode ever measured — compact
+ * ~10k, pretty ~17.5k, canonical-key disobedience 19-21k, and the 08/30
+ * calibration run's ≥26k. The previous 3400/member (20k at 5 members) sat
+ * INSIDE that band under a comment claiming it sat above it: every day call
+ * truncated at the cap, billed in full, then burned a doomed doubled-cap retry
+ * — $4.16 for zero days. A cap bills only real tokens, so generosity is free;
+ * what it must never be is a value an honest emission can reach. Tighten only
+ * after structured outputs prove compact emission across several runs.
  */
 export function dayMaxTokens(memberCount: number): number {
-  const perMember = 3400;
+  const perMember = 5800;
   return Math.min(
     MAX_OUTPUT_TOKENS,
     Math.max(DAY_MAX_TOKENS, 3000 + perMember * Math.max(1, memberCount)),
@@ -141,18 +164,21 @@ export function dayMaxTokens(memberCount: number): number {
 }
 
 /**
- * Wall-clock cap for ONE day/skeleton call, scaled to its size. The default
- * 4-min cap (anthropic.ts) aborts a legitimately large generation mid-stream.
- * The translation branch (70s/member) is gone with the dayMaxTokens fossil —
- * the day call has been Arabic-only since 07-24, and a ceiling is what a slow
- * call expands to fill: at 5 members it granted 450s to ~200-250s of real work,
- * which is exactly the doomed-call length that ate the run budget. 40s/member
- * covers the measured worst mode (pretty-mode ~17.5k tokens at 65 tok/s ≈ 269s
- * against the 360s ceiling at m=5) with margin.
+ * Wall-clock cap for ONE day/skeleton call, derived from the CAP rather than
+ * hand-tuned per member: the time a full-cap emission needs at the worst
+ * measured stream rate (65 tok/s) plus time-to-first-token. Deriving it keeps
+ * cap and ceiling consistent by construction — the 08/30 failure was the pair
+ * drifting apart (a 360s ceiling under a cap whose honest emission needs ~400s,
+ * so the doubled-cap retry was doomed before it started). At 5 members:
+ * 32,000/65 + 20s ≈ 512s. A ceiling is an ABORT bound, not a target — typical
+ * calls finish far under it, and boundedCallTimeoutMs still clamps every call
+ * to the run's remaining budget.
  */
 export function bigCallTimeoutMs(memberCount: number): number {
-  const perMember = 40_000;
-  return Math.min(600_000, 240_000 + perMember * Math.max(0, memberCount - 2));
+  return Math.min(
+    600_000,
+    Math.round((dayMaxTokens(memberCount) / 65) * 1000) + 20_000,
+  );
 }
 
 /**

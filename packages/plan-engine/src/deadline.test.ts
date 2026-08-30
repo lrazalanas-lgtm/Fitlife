@@ -181,24 +181,26 @@ describe("run deadline — days are deferred, never started into a hard kill", (
     const t0 = startClock();
     scriptModel({ skeletonMs: 50_000, dayMs: 100_000 });
 
-    // 50s skeleton + 100s/day, and a day only starts with DAY_CALL_ESTIMATE_MS
-    // (150s) left → 4 days fit, the last 3 are deferred.
-    const deadlineMs = t0 + 500_000;
+    // 50s skeleton + 100s/day. Phase 1 needs its 0.6x window ABOVE the solo
+    // day-loop reserve (4 waves x 150s = 600s), so the budget must clear ~690s
+    // for the run to start at all; at 700s the day gate (150s) then refuses
+    // whichever day would begin past t=550 — one day deferred, never killed.
+    const deadlineMs = t0 + 700_000;
     const res = await generateMealPlan({
       anthropicApiKey: "k",
       context: makeContext(),
       deadlineMs,
     });
 
-    expect(dayCallCount()).toBe(4);
-    expect(res.missingDays).toHaveLength(3);
+    expect(dayCallCount()).toBe(6);
+    expect(res.missingDays).toHaveLength(1);
     // The run ended INSIDE its box. This is the whole point: the old code sailed
     // past the function budget and was killed with no terminal write at all.
     expect(virtualNow).toBeLessThanOrEqual(deadlineMs);
 
     // What it hands back is a real, usable partial week.
     const mom = res.plan.members.find((m) => m.member_id === "mom")!;
-    expect(mom.days.filter((d) => d.meals.length > 0)).toHaveLength(4);
+    expect(mom.days.filter((d) => d.meals.length > 0)).toHaveLength(6);
     expect(res.plan.generating).toBe(false);
   });
 
@@ -209,11 +211,13 @@ describe("run deadline — days are deferred, never started into a hard kill", (
     const res = await generateMealPlan({
       anthropicApiKey: "k",
       context: makeContext(),
-      deadlineMs: t0 + 500_000,
+      deadlineMs: t0 + 700_000,
     });
 
-    expect(res.missingDaysCause).toBe(BUDGET_DEFERRED_CAUSE);
-    expect(res.missingDaysCause).toMatch(/no model call made/);
+    // Histogram class + the run's call census: a deferral is visibly "no model
+    // call", and the census says how many calls the run DID make.
+    expect(res.missingDaysCause).toMatch(/1x deferred \(no model call\)/);
+    expect(res.missingDaysCause).toMatch(/\[\d+ model calls\]/);
   });
 
   it("generates the whole week when no deadline is given — unchanged behavior", async () => {
@@ -236,15 +240,15 @@ describe("run deadline — days are deferred, never started into a hard kill", (
     const res = await generateMealPlan({
       anthropicApiKey: "k",
       context: makeContext(),
-      deadlineMs: t0 + 500_000,
+      deadlineMs: t0 + 700_000,
     });
 
-    // 4 real day calls and nothing more — including across the second-chance
+    // 6 real day calls and nothing more — including across the second-chance
     // wave, which must not turn a budget stop into another round of spending.
-    expect(dayCallCount()).toBe(4);
+    expect(dayCallCount()).toBe(6);
     // And the deferred days are reported exactly once each: not lost, not doubled.
     expect(res.missingDays).toEqual([...new Set(res.missingDays)]);
-    expect(res.missingDays).toHaveLength(3);
+    expect(res.missingDays).toHaveLength(1);
   });
 
   it("keeps the real failure as the reported cause instead of drowning it in budget notices", async () => {
@@ -255,34 +259,35 @@ describe("run deadline — days are deferred, never started into a hard kill", (
     const res = await generateMealPlan({
       anthropicApiKey: "k",
       context: makeContext(),
-      deadlineMs: t0 + 660_000,
+      deadlineMs: t0 + 750_000,
     });
 
     expect(res.missingDays).toEqual([0, 1, 2, 6]);
-    // The second-chance wave is skipped when the budget is spent. Were it to run
-    // anyway it would re-defer all four days, pushing four more budget notices
-    // and making "ran out of time" outvote the actual defect — so the operator
-    // would chase a capacity problem instead of the bug that caused three days
-    // to fail. summarizeDayErrors picks the most frequent message.
-    expect(res.missingDaysCause).toContain("boom");
+    // The histogram counts CLASSES, so the real defect leads and the single
+    // deferral cannot outvote it — the 08/30 failure mode, where unique per-day
+    // strings let two free deferrals outvote five paid deaths.
+    expect(res.missingDaysCause).toMatch(/^3x boom/);
+    expect(res.missingDaysCause).toContain("1x deferred (no model call)");
     expect(res.missingDaysCause).not.toContain("run budget spent");
   });
 
-  it("defers every day when the skeleton alone consumed the budget", async () => {
+  it("refuses phase 1 outright when the budget cannot hold skeleton + day loop — before any model call", async () => {
     const t0 = startClock();
     scriptModel({ skeletonMs: 400_000, dayMs: 100_000 });
 
-    // No day can start, so nothing was carried and nothing generated: the engine
-    // throws rather than persisting an empty plan — and the caller's catch now
-    // writes a terminal row WITH the skeleton's cost on it.
+    // The old behavior here was "run the skeleton anyway, then defer all 7
+    // days" — paid tokens for a plan that could never happen. Phase 1 now has
+    // a hard deadline (run deadline minus the day loop's reserve) and refuses
+    // to START an attempt with under 0.6x the skeleton ceiling of room: a
+    // doomed call is worse than no call, and $0 beats the 08/30 run's $4.16.
     await expect(
       generateMealPlan({
         anthropicApiKey: "k",
         context: makeContext(),
         deadlineMs: t0 + 450_000,
       }),
-    ).rejects.toThrow(/deferred: run budget spent/);
-    expect(dayCallCount()).toBe(0);
+    ).rejects.toThrow(/Phase 1 refused/);
+    expect(mockedStream).not.toHaveBeenCalled();
   });
 });
 
@@ -295,8 +300,9 @@ describe("run deadline — corrective re-rolls yield to the budget", () => {
     const res = await generateMealPlan({
       anthropicApiKey: "k",
       context: makeContext(),
-      // Generous: the band re-rolls are affordable.
-      deadlineMs: Date.now() + 10 * 60_000,
+      // Generous: the band re-rolls are affordable (and phase 1's reserve —
+      // 600s for a solo household — is comfortably cleared).
+      deadlineMs: Date.now() + 15 * 60_000,
     });
 
     // 1 initial + CONTENT_MAX_RETRIES (2) corrective re-rolls.
@@ -306,9 +312,11 @@ describe("run deadline — corrective re-rolls yield to the budget", () => {
 
   it("accepts the closest attempt instead of re-rolling when the budget is tight", async () => {
     const t0 = startClock();
-    scriptModel({ skeletonMs: 10_000, dayMs: 100_000, dayCalories: 800, days: [0] });
+    // A slow 600s day call: after it, only ~90s remain — a re-roll (150s gate)
+    // no longer fits, while phase 1's floor (~690s) was cleared at dispatch.
+    scriptModel({ skeletonMs: 10_000, dayMs: 600_000, dayCalories: 800, days: [0] });
 
-    const deadlineMs = t0 + 160_000;
+    const deadlineMs = t0 + 700_000;
     const res = await generateMealPlan({
       anthropicApiKey: "k",
       context: makeContext(),
@@ -327,15 +335,18 @@ describe("run deadline — corrective re-rolls yield to the budget", () => {
 
 describe("onUsage — a failed or trimmed run is still costed", () => {
   it("reports running totals, so the caller can bill a run that never returns", async () => {
-    const t0 = startClock();
-    scriptModel({ skeletonMs: 400_000, dayMs: 100_000 });
+    startClock();
+    // Every day fails deterministically → the run throws AFTER the skeleton
+    // spent real tokens. (The old fixture starved the budget instead, but that
+    // now refuses phase 1 before any call — $0 spent is the intended outcome
+    // there, and this test is about billing a run that DID spend.)
+    scriptModel({ skeletonMs: 1_000, dayMs: 1_000, throwOnDays: DAYS });
 
     let accrued = { input_tokens: 0, output_tokens: 0, cost_usd: 0 };
     await expect(
       generateMealPlan({
         anthropicApiKey: "k",
         context: makeContext(),
-        deadlineMs: t0 + 450_000,
         onUsage: (u) => {
           accrued = u;
         },
@@ -358,11 +369,11 @@ describe("onUsage — a failed or trimmed run is still costed", () => {
     const res = await generateMealPlan({
       anthropicApiKey: "k",
       context: makeContext(),
-      deadlineMs: t0 + 500_000,
+      deadlineMs: t0 + 700_000,
       onUsage: (u) => seen.push(u.output_tokens),
     });
 
-    expect(seen).toHaveLength(5); // 1 skeleton + 4 days
+    expect(seen).toHaveLength(7); // 1 skeleton + 6 days
     expect(seen).toEqual([...seen].sort((a, b) => a - b)); // monotonic
     expect(seen.at(-1)).toBe(res.usage.output_tokens);
   });
