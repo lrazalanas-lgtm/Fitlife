@@ -38,6 +38,12 @@ import {
   ownerRequiresDoctorSignOff,
   memberRequiresDoctorSignOff,
 } from "../../../../packages/plan-engine/src/medicalGate";
+import { getBeneficiaries } from "../../../../packages/plan-engine/src/buildContext";
+import {
+  shouldChainContinuation,
+  PLAN_CHAIN_MAX_HOPS,
+} from "../../../../packages/plan-engine/src/chain";
+import { planModelLabel } from "../../../../packages/plan-engine/src/constants";
 import { isChildByAge } from "../../../../packages/plan-engine/src/childRule";
 // Error reporting over plain fetch — @sentry/* cannot be bundled here for the
 // same reason @supabase/supabase-js cannot (see the note above). Without this
@@ -238,6 +244,142 @@ async function sbInsertReturning(
   }
 }
 
+
+/**
+ * Mint the next hop's rows and POST this function to itself.
+ *
+ * Sequenced against the 00014 per-kind lock: the caller has already closed its
+ * own plan_generations row ('completed'), so the child's 'started' insert here
+ * is the lock CLAIM. A 23505 means a page-mounted drain or a manual regenerate
+ * legitimately won the seconds-wide unlock window — archive our child row (the
+ * exact createPlanRows race protocol) and yield: someone else is continuing.
+ *
+ * The POST targets `req.url` with the in-process secret, never an env-derived
+ * URL — CLAUDE.md documents Next-runtime/Functions-runtime env-scope mismatch
+ * as a real silent failure mode, and req.url is correct by construction.
+ *
+ * On ANY enqueue failure — non-202 or an exception (the 8s abort included) —
+ * roll back: archive the child plan row, fail its gen row. This is safe even if
+ * the POST actually WAS enqueued and the abort was just slow plumbing: a late-
+ * starting child hits its idempotency probe, finds the archived/failed rows,
+ * and no-ops ("Already settled"). What must NOT be copied here is dispatch.ts's
+ * "timeout = probably enqueued" optimism — the app-side dispatcher has a user
+ * watching a spinner and a sweeper to clean up; a leaked orphan lock from a
+ * background hop has neither, it just blocks the household's next run for 90s+.
+ * Rollback restores today's exact drain-recoverable state; the chain is an
+ * upgrade over it, never a new way to wedge.
+ *
+ * Returns true when the continuation was dispatched (exactly 202).
+ */
+async function dispatchChainContinuation(params: {
+  reqUrl: string;
+  secret: string;
+  supabaseUrl: string;
+  serviceKey: string;
+  userId: string;
+  /** The CHILD's depth (parent's + 1). */
+  chainDepth: number;
+  feedback?: string;
+  limitMemberIds?: string[];
+}): Promise<boolean> {
+  const { reqUrl, secret, supabaseUrl, serviceKey, userId, chainDepth } = params;
+  const childId = crypto.randomUUID();
+
+  // Child rows, mirroring createPlanRows (meal_plans first, then the gen row —
+  // whose insert is the lock claim under the 00014 partial unique index).
+  try {
+    await sbInsertReturning(supabaseUrl, serviceKey, "meal_plans", {
+      id: childId,
+      user_id: userId,
+      status: "generating",
+      plan_data: {},
+      ai_model: planModelLabel(),
+    });
+  } catch (err) {
+    console.error("[generate-plan-background] chain: child plan insert failed", err);
+    await captureToSentry(err, { step: "chain-child-plan-insert", userId });
+    return false;
+  }
+  try {
+    await sbInsertReturning(supabaseUrl, serviceKey, "plan_generations", {
+      user_id: userId,
+      meal_plan_id: childId,
+      model: planModelLabel(),
+      status: "started",
+      started_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    const raced =
+      err instanceof PostgrestInsertError && err.code === "23505";
+    // Archive, never fail: a 'failed' row would become the household's latest
+    // plan and flash the failure UI over a healthy in-flight run.
+    await sbUpdate(supabaseUrl, serviceKey, "meal_plans", `id=eq.${childId}`, {
+      status: "archived",
+      error_message: raced
+        ? "superseded: another generation was already in flight"
+        : "chain continuation: audit row insert failed",
+    }).catch((e) =>
+      console.error("[generate-plan-background] chain: archive failed", e),
+    );
+    if (!raced) {
+      console.error("[generate-plan-background] chain: gen row insert failed", err);
+      await captureToSentry(err, { step: "chain-child-gen-insert", userId });
+    }
+    return false;
+  }
+
+  try {
+    const res = await fetch(reqUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-internal-secret": secret,
+      },
+      body: JSON.stringify({
+        userId,
+        mealPlanId: childId,
+        carryOver: true,
+        chainDepth,
+        feedback: params.feedback,
+        limitMemberIds: params.limitMemberIds,
+      }),
+      redirect: "manual",
+      signal: AbortSignal.timeout(8000),
+    });
+    if (res.status !== 202) {
+      throw new Error(`chain enqueue: expected 202, got ${res.status}`);
+    }
+    console.log("[generate-plan-background] chained continuation", {
+      userId,
+      childId,
+      chainDepth,
+    });
+    return true;
+  } catch (err) {
+    console.error("[generate-plan-background] chain: enqueue failed", err);
+    await captureToSentry(err, { step: "chain-enqueue", userId });
+    await sbUpdate(supabaseUrl, serviceKey, "meal_plans", `id=eq.${childId}`, {
+      status: "archived",
+      error_message: "chain enqueue failed",
+    }).catch((e) =>
+      console.error("[generate-plan-background] chain: rollback archive failed", e),
+    );
+    await sbUpdate(
+      supabaseUrl,
+      serviceKey,
+      "plan_generations",
+      `meal_plan_id=eq.${childId}`,
+      {
+        status: "failed",
+        error_message: "chain enqueue failed",
+        completed_at: new Date().toISOString(),
+      },
+    ).catch((e) =>
+      console.error("[generate-plan-background] chain: rollback gen row failed", e),
+    );
+    return false;
+  }
+}
 
 // Read a single plan_data row by id and validate it. Returns the parsed MealPlan
 // or null (no row / unparseable). Used by translate mode so the whole plan no
@@ -586,6 +728,10 @@ const handler = async (req: Request): Promise<Response> => {
     // Tier cap: when the family exceeds the plan limit, the allow-list of non-mom
     // beneficiary ids to generate this run (mom is always included). Others defer.
     limitMemberIds?: string[];
+    // Continuation chaining: how many hops deep this invocation is. 0 (absent)
+    // for a user-dispatched run; each self-dispatched continuation increments.
+    // Clamped, never trusted raw — the cap is what bounds a poisoned chain.
+    chainDepth?: number;
   };
   try {
     body = await req.json();
@@ -960,7 +1106,8 @@ const handler = async (req: Request): Promise<Response> => {
       );
     }
 
-    const { plan, usage, missingDays, missingDaysCause } = await generateMealPlan({
+    const { plan, usage, missingDays, missingDaysCause, daysCompleted } =
+      await generateMealPlan({
       anthropicApiKey: anthropicKey,
       context,
       existingPlan: existingPlan ?? null,
@@ -1126,6 +1273,68 @@ const handler = async (req: Request): Promise<Response> => {
       durationMs,
       missingDays,
     });
+
+    // ── Continuation chaining (success path ONLY — a failed run never chains:
+    // its row is 'failed', so a child's carry-over would skip it and re-buy a
+    // pre-parent week). A run that ends short used to just END, and the partial
+    // week then waited for a logged-in browser to mount /plan or /dashboard —
+    // the only place DeferredMemberDrain fires. Instead, dispatch our own
+    // successor inside the finalize reserve: both terminal writes above are
+    // done (the 'ready' plan is the child's carry-over source, and closing the
+    // audit row is what releases the 00014 per-kind lock BEFORE the child
+    // claims it). Only ever a WIDE fill — scoped runs (add-member, per-member
+    // regen, shared-group rebuild) have their own owners in the drain/add flow,
+    // whose routing (regenerateSharedGroup, onlyMemberId) this worker does not
+    // carry.
+    const chainDepth = Math.min(
+      Math.max(0, Math.trunc(body.chainDepth ?? 0)),
+      PLAN_CHAIN_MAX_HOPS,
+    );
+    const wideRun =
+      !body.onlyMemberId &&
+      !body.regenerateMemberId &&
+      !body.regenerateSharedGroup &&
+      !body.regenScope;
+    if (
+      wideRun &&
+      shouldChainContinuation({
+        plan: finalPlan,
+        // From the RUN's context — already narrowed by limitMemberIds above, so
+        // a tier-capped household's deferred members do not read as "absent".
+        beneficiaryIds: getBeneficiaries(context).map((b) => b.member_id),
+        missingDays,
+        daysCompleted,
+        chainDepth,
+      })
+    ) {
+      const hop = chainDepth + 1;
+      const chained = await dispatchChainContinuation({
+        reqUrl: req.url,
+        secret: expected,
+        supabaseUrl,
+        serviceKey,
+        userId,
+        chainDepth: hop,
+        feedback: body.feedback,
+        limitMemberIds: body.limitMemberIds,
+      });
+      if (chained) {
+        // Keep the audit trail legible: the parent's row says its short week is
+        // being continued, not abandoned. Best-effort — the chain is already
+        // dispatched either way.
+        await sbUpdate(
+          supabaseUrl,
+          serviceKey,
+          "plan_generations",
+          `meal_plan_id=eq.${mealPlanId}`,
+          {
+            error_message: `${partialNote ?? "partial"} — chained continuation (hop ${hop})`,
+          },
+        ).catch((e) =>
+          console.warn("[generate-plan-background] chain note write failed", e),
+        );
+      }
+    }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     const durationMs = Date.now() - startMs;

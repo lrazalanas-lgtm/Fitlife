@@ -922,8 +922,114 @@ tier-limit cluster above is bypassed and untestable while it is on.
 places and `member_type` in 5 — `familyMemberInputSchema` now rejects `role: "housekeeper"`
 (that was a tier-limit bypass), but the dual key itself stands; **00025 adds exactly that CHECK**, and repairs both directions first so it cannot reject
 on apply (the single write path in `addHousekeeper` already sets both, so the repairs are
-no-ops on a healthy table). NOT YET APPLIED to prod — apply it and re-run
-`scripts/verify-migrations.sql`, which now covers it. Plus three
+no-ops on a healthy table). APPLIED to prod (owner confirmed 08/2026);
+`scripts/verify-migrations.sql` covers it. Plus three
 low-severity leads not independently verified: feminine-only copy for a male owner through the
 member wizards, the claim that member edits auto-regenerate via `memberEdit.ts` being
 UI-reachable, and housekeeper-language sold as `family`-tier-only while reachable on every tier.
+
+---
+
+## 7/7 as arithmetic: the generation-economics rebuild, Stages 0+1 (08/2026)
+
+The owner's directive: «economical price for each generation, 0 failed attempts, all the
+generations should return all 7 days in a reasonable time». Measured before the change,
+a 5-beneficiary + housekeeper household delivered 1-4 days of 7 per invocation at
+$2.02-3.32 (0 of ~12 attempts ever completed a week in one run), a clean week cost ~$3.40
+of tokens but ~$7-8 in practice, and a partial week then waited for a PAGE VISIT because
+`DeferredMemberDrain` is the only self-heal and it mounts on /plan + /dashboard only.
+A four-phase multi-agent audit (token anatomy on real prod plans, budget arithmetic,
+continuation feasibility, a failure ledger over all 26 recorded runs) found the causes;
+adversarially-verified fixes shipped as Stages 0+1. Stage 2 (dish-once emission, a further
+~30% output cut) is designed but deliberately NOT shipped until compact emission is proven
+on production runs.
+
+**The three measurement facts that reframed everything.** (1) Two obvious fixes had
+ALREADY shipped (07-24, commit fd63a3a): translation left the day call (it is the separate
+Haiku pass) and shared-batch math moved into code — but `dayMaxTokens`/`bigCallTimeoutMs`
+still carried `hasTranslation ? 4500 : 2600` tok and `70s : 40s` per-member branches
+pricing the INLINE era. The fossil only bought bigger caps and longer doomed calls (450s
+ceilings for ~200-250s of work). Both branches are DELETED; the helpers take memberCount
+alone. (2) The model flips a coin on formatting: measured tok/byte across prod runs is
+bimodal — 0.54 (compact JSON) vs 0.97 (pretty-printed), i.e. pretty costs +80% output —
+and nothing pinned it. (3) 65-90% of recorded output spend was DISCARDED completions
+(band/content re-rolls and truncation retries re-billing whole days), and aborted streams
+record 0 tokens while Anthropic bills what streamed, so the cost gauge omitted exactly the
+waste.
+
+**Stage 0 — the call fits its budget.** `dayMaxTokens` = 3000 + **3400**/member (NOT the
+2600 the fossil-removal alone would give: the cap must sit ABOVE the measured pretty-mode
+emission ~17.5k @ 5 members until compact is proven, or every non-compact reply truncates
+into the doubled-cap retry — verifier catch). `bigCallTimeoutMs` = 240s + 40s/member
+(360s @ 5, was 450s). Compact JSON is pinned twice: a directive in the day + skeleton
+prompts (dynamic blocks only — cached STATIC_SYSTEM untouched, no invalidation) AND an
+**assistant prefill** (`streamAnthropic` gained `assistantPrefill`; day = `{"d":`,
+skeleton = `{`). The returned `text` and any error's `partialText` INCLUDE the prefill, so
+parse/salvage paths prepend nothing — `anthropicStream.test.ts` pins that contract with a
+faked SSE body, because every other test mocks `streamAnthropic` wholesale and a
+regression would break salvage silently. The small-household cliff is fixed:
+`dayConcurrency` for 1/2/3 members is now 2/3/4 (sequential-1 could not fit a week from
+3 members up, or 2 with a maid — the calm 1→7 fill was arithmetically unaffordable);
+`PLAN_DAY_CONCURRENCY` now overrides small households too.
+
+**Stage 1 — failure stops being a terminal state.** Five layers, each closing a ledger
+entry: (a) ALL mid-stream deaths are `AnthropicCallError` — the raw-socket wrap (undici
+`terminated`, was unretryable+unsalvageable, $2.02 lost once) and the SSE `error` event
+(threw WITHOUT partialText, discarding the streamed text) both carry `partialText` + a
+billed-spend estimate (`estimatedOutputTokens` ≈ streamed utf8 bytes × 0.6,
+`inputTokensAtFailure` real from message_start); the message contains "stream error" ON
+PURPOSE — `isRetryable` keys on it. Day-loop and skeleton catches accrue those estimates
+into usage so failed calls stop reading $0. (b) The SKELETON gets the day loop's retry
+discipline (it had ZERO retries — one 429 on the single most load-bearing call failed the
+whole run): MAX_RETRIES API-transients honoring Retry-After + one content re-roll, gated
+on `wait + MIN_VIABLE_CALL_MS + DAY_CALL_ESTIMATE_MS` — deliberately NOT
+`dayLoopReserveMs`, which exceeds the whole budget at small-household concurrency
+(verifier catch: the reserve-based gate would be dead code exactly where the skeleton
+matters most). (c) The doubled-cap truncation retry is budget-gated (it was the ONE
+ungated retry path). (d) `gen_attempts` now charges WIDE runs: every targeted member with
+≥1 actually-ATTEMPTED (non-BUDGET_DEFERRED) missing day is bumped at snapshot time —
+before this, the wide drain run could re-fire on every page visit forever
+(MEMBER_GEN_MAX_ATTEMPTS could never trip while ≥2 members were short), unbounded spend
+behind free-access mode. A hard-killed run may persist a count ±1 of final truth —
+bounded noise, documented in code. (e) **The worker chains its own continuation**
+(`generate-plan-background.mts` + `packages/plan-engine/src/chain.ts`): on the SUCCESS
+path only, after BOTH terminal writes (the 'ready' plan is the child's carry-over source;
+closing the audit row releases the 00014 per-kind lock BEFORE the child claims it), a run
+that is short but made progress mints child meal_plans + plan_generations rows via
+`sbInsertReturning` (23505 → a drain/manual dispatch won the seconds-wide unlock window:
+archive the child, yield — the exact `createPlanRows` race protocol) and POSTs
+**`req.url`** (never an env-derived URL — Functions-runtime env-scope mismatch is a
+documented silent failure) with the in-process secret, `{userId, mealPlanId: childId,
+carryOver: true, chainDepth+1, feedback, limitMemberIds}`, 8s abort, requires exactly
+202. ANY enqueue failure (abort included) rolls back — archive child + fail child gen
+row; safe even if the POST actually landed, because the late child no-ops at
+`generationAlreadySettled`. Do NOT copy dispatch.ts's "timeout = probably enqueued"
+here: that optimism leaks an orphan lock with no user watching. `shouldChainContinuation`
+(one predicate, tested truth-table): missing days AND `daysCompleted > 0` (no progress →
+no chain — an identical successor meets the same wall; this makes the hop cap bound
+WASTE, not just invocations) AND `chainDepth < PLAN_CHAIN_MAX_HOPS` (3) AND **every
+beneficiary present in the plan** (an absent member needs a skeleton + possibly
+`regenerateSharedGroup`; the wide continuation has no such routing — the drain owns it)
+AND someone short is under the attempt cap. The worker additionally chains only wide runs
+(no onlyMemberId/regenerateMemberId/regenerateSharedGroup/regenScope). Chained hops NOTE
+themselves on the parent's audit row («chained continuation (hop N)»).
+`incompleteInPlanMemberIds` MOVED into the engine (chain.ts); `drainScope.ts` re-exports
+it — drain and chain deciding "who is short" from one definition, per the same-rule-twice
+root cause. Its old comment claimed carry-over runs are "skeleton-free"; that is FALSE
+for family-wide day losses (familyDishGrid seeds only from days WITH meals), corrected in
+place — a hop refilling whole-family days re-runs a skeleton and still fits its fresh
+budget.
+
+**What this does NOT close (known, accepted):** a platform hard-kill before the terminal
+writes cannot chain (recovery = the 90s ACK sweep + 15-min staleness + page visit, as
+today, on a now-smaller exposure window); a deterministically model-hostile member caps
+at 3 attempts and ships a visible short week instead of burning unbounded money; a fresh
+run where ALL days fail throws and never chains (the retry card, as today). Concurrency 7
+for LARGE households (one wave) is deliberately NOT the default until a QA probe rules
+out Sonnet 429s — `PLAN_DAY_CONCURRENCY=7` is the env lever. Stage 2 (dish-once emission,
+day calls ~7k tokens, ~$1.2-1.5/week for 6 people) waits on 2-3 production runs proving
+compact emission ≈100%; only then tighten `dayMaxTokens` toward 2600/member. Guarded by
+`chain.test.ts`, `anthropicStream.test.ts`, the reworked `dayBudget.test.ts` (asserts the
+old sequential cliff could NOT fit and the new 2/3/4 fill can) + `skeletonBudget.test.ts`;
+the bg function remains a mirror — **when changing `runMealPlanGeneration` or the engine's
+retry/budget behavior, check generate-plan-background.mts: it is the production path.**
