@@ -156,7 +156,7 @@ Before building ANY section, you must:
 
 **Plan engine package**: Lives at packages/plan-engine (was originally inline in apps/app).
 
-**Settings page**: PDPL compliance shipped — /settings has account info + data export + immediate hard-delete via typed-confirmation modal. Public routes /privacy and /terms exist with placeholder Markdown content (needs real legal text before scaling).
+**Settings page**: PDPL compliance shipped — /settings has account info + data export + immediate hard-delete via typed-confirmation modal. Public routes /privacy and /terms carry comprehensive PDPL-aligned Arabic DRAFTS (07/2026, accuracy-audited 08/2026 against the shipped product — children on the season board, body photos, housekeeper sex question). Still needs Saudi counsel review + the [BRACKETED] entity/contact fields filled before scaling; when a feature changes who appears on a shared surface or what is stored, re-audit both content.ts files.
 
 **Sara's Cookbook Inspiration (Prompt 3.3a)**: The AI system prompt now includes a structured profile of Sara's "كنز الوصفات الصحية" cookbook (101 recipes, high-protein/no-sugar/no-refined-flour). Recipes are NOT extracted verbatim from the PDF — instead, the AI generates fresh recipes that align with the cookbook's style, ingredient palette, and constraints. The block lives in `packages/plan-engine/src/systemPrompt.ts` as `SARA_COOKBOOK`, appended to the cached `STATIC_SYSTEM` after Sara's methodology (methodology takes precedence for medical/pregnancy needs). A non-fatal log-only guard in `generate.ts` warns on refined-flour/sugar deviations. PDF source (if added) lives in `product/sara-cookbook.pdf` for reference but is not parsed at runtime.
 
