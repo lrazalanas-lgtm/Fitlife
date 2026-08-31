@@ -91,6 +91,40 @@ export function isKnownPricingModel(model: string): boolean {
 }
 
 /**
+ * Models the structured-outputs feature (`output_config.format` json_schema)
+ * accepts, per docs.claude.com 08/2026. NOTE THE ABSENCE: claude-sonnet-4-6 —
+ * today's day model — is NOT supported, exactly the way it rejects assistant
+ * prefill. So the day call sends a schema only when the model can take it, and
+ * flipping `PLAN_DAY_MODEL` to claude-sonnet-5 (cheaper than 4.6: $2/$10 vs
+ * $3/$15) or claude-haiku-4-5 is what activates enforcement — the intended
+ * env-only lever for the calibration session, with removal as rollback.
+ */
+const STRUCTURED_OUTPUT_MODELS = new Set([
+  "claude-fable-5",
+  "claude-opus-5",
+  "claude-opus-4-8",
+  "claude-sonnet-5",
+  "claude-haiku-4-5",
+  "claude-haiku-4-5-20251001",
+  "claude-opus-4-5",
+  "claude-opus-4-1",
+]);
+
+export function supportsStructuredOutputs(model: string): boolean {
+  return STRUCTURED_OUTPUT_MODELS.has(model);
+}
+
+/**
+ * Stage 3's env flag: multi-member day calls emit each dish ONCE with
+ * per-sharer portion lines (~×0.69 measured output at 2+ members) instead of
+ * repeating the full dish per sharer. OFF by default — it flips on for the
+ * calibration session AFTER structured outputs prove compact emission, and
+ * `PLAN_DISH_ONCE=1` → delete-the-var is the whole rollback story. Solo day
+ * calls never use it regardless (nothing is shared).
+ */
+export const DISH_ONCE_EMISSION = process.env.PLAN_DISH_ONCE?.trim() === "1";
+
+/**
  * Output-token ceiling for the WHOLE family's weekly plan (single call).
  * A full 7-day plan with rich 8-field recipes can exceed 16k even for a solo
  * member, and multi-member plans definitely do — truncation (stop_reason=

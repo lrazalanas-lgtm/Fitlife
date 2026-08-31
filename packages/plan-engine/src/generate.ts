@@ -8,6 +8,8 @@ import {
   DAY_MAX_TOKENS,
   skeletonMaxTokens,
   skeletonTimeoutMs,
+  supportsStructuredOutputs,
+  DISH_ONCE_EMISSION,
   TRANSLATE_CALL_TIMEOUT_MS,
   PLAN_WEEK_DAYS,
   dayMaxTokens,
@@ -71,6 +73,12 @@ import { isChildByAge } from "./childRule";
 import { riyadhTodayISO, khaleejiDayName } from "./dates";
 import { canonicalRecipeKey } from "./canonicalRecipeKey";
 import { captureToSentry } from "./sentryReport";
+import { terseDaySliceOutputFormat } from "./terseDaySliceSchema";
+import {
+  isDishOnceShape,
+  expandDishOnceDaySlice,
+  dishOnceDaySliceOutputFormat,
+} from "./dishOnceDaySlice";
 
 // Accepts any Supabase client shape (cookie-typed or service-role admin).
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -341,6 +349,21 @@ export function summarizeDayErrors(errors: string[]): string {
 // giving up (separate from MAX_RETRIES, which governs API-transient retries).
 const CONTENT_MAX_RETRIES = 2;
 
+// Structured outputs for the day call — the schema-ENFORCED half of compact
+// emission, active only when the configured day model accepts the feature
+// (claude-sonnet-4-6 does not; PLAN_DAY_MODEL=claude-sonnet-5 or
+// claude-haiku-4-5 turns it on, env-only). When active, a day reply is valid
+// terse JSON by construction: no fences, no preambles, no invented keys, no
+// pretty mode. The tok/byte telemetry + tripwire below still watch it — a
+// schema constrains STRUCTURE, and Unicode-escaped Arabic inside JSON strings
+// would still inflate tokens invisibly.
+const DAY_STRUCTURED_FORMAT = supportsStructuredOutputs(DAY_MODEL)
+  ? terseDaySliceOutputFormat()
+  : undefined;
+const DISH_ONCE_STRUCTURED_FORMAT = supportsStructuredOutputs(DAY_MODEL)
+  ? dishOnceDaySliceOutputFormat()
+  : undefined;
+
 /**
  * Why a day carries no meals when the run ran out of budget rather than failing.
  * Distinct wording on purpose: it lands in `plan_generations.error_message` via
@@ -487,8 +510,11 @@ export function rescueDaySlice(
 
   let parsed: DaySlice;
   try {
+    const rawRepaired = JSON.parse(repaired);
     const r = DaySliceSchema.safeParse(
-      expandTerseDaySlice(JSON.parse(repaired)),
+      isDishOnceShape(rawRepaired)
+        ? expandDishOnceDaySlice(rawRepaired)
+        : expandTerseDaySlice(rawRepaired),
     );
     if (!r.success) return null;
     parsed = r.data;
@@ -1634,6 +1660,21 @@ export async function generateMealPlan(params: {
   // First failed day's full annotated record (class + attempt trace + reply
   // shape) — the specimen the class histogram cannot carry.
   let firstDayFailureDetail: string | null = null;
+  // Per-run telemetry, attached to the FINAL plan as plan_data.gen_metrics —
+  // the measured baseline the delivery plan's model/config decisions grade
+  // against (band pass rate, emission shape, truncation/salvage counts).
+  const genMetrics = {
+    model: DAY_MODEL,
+    structured_output: DAY_STRUCTURED_FORMAT != null,
+    dish_once: DISH_ONCE_EMISSION,
+    day_tok_per_byte: [] as number[],
+    truncations: 0,
+    schema_failures: 0,
+    band_checked_days: 0,
+    band_first_pass: 0,
+    salvages: 0,
+  };
+  let emissionShapeAlerted = false;
 
   let skeleton: PlanSkeleton;
   if (needsSkeleton.length > 0) {
@@ -2182,6 +2223,14 @@ export async function generateMealPlan(params: {
         dayMemberIds.has(m.member_id),
       ),
     };
+    // Dish-once applies to MULTI-member day calls only (nothing is shared on a
+    // solo day) and only behind its env flag; the prompt (buildDayPrompt reads
+    // the same flag) and the enforced schema move together, so the model is
+    // never asked one shape and constrained to another.
+    const useDishOnce = DISH_ONCE_EMISSION && daySkeleton.members.length > 1;
+    const dayOutputFormat = useDishOnce
+      ? DISH_ONCE_STRUCTURED_FORMAT
+      : DAY_STRUCTURED_FORMAT;
     const basePrompt = buildDayPrompt(
       context,
       daySkeleton,
@@ -2252,6 +2301,7 @@ export async function generateMealPlan(params: {
               systemStatic: STATIC_SYSTEM,
               systemPrompt: prompt,
               timeoutMs: callTimeout(),
+              outputFormat: dayOutputFormat,
             }));
         salvagedSlice = null;
         totalIn += res.tokensIn;
@@ -2264,12 +2314,36 @@ export async function generateMealPlan(params: {
           res.cacheReadTokens,
         );
         publishUsage();
+        // Emission-shape telemetry: tokens-per-byte is the mode fingerprint
+        // (~0.55 compact, ~0.97 pretty, >1.2 Unicode-escaped Arabic or
+        // degenerate repetition — a schema cannot prevent the last one, it
+        // hides INSIDE valid JSON strings). One Sentry alert per run.
+        if (res.tokensOut > 0 && res.stopReason !== "salvaged") {
+          const replyBytes = new TextEncoder().encode(res.text).length;
+          if (replyBytes > 0) {
+            const tokPerByte =
+              Math.round((res.tokensOut / replyBytes) * 1000) / 1000;
+            genMetrics.day_tok_per_byte.push(tokPerByte);
+            if (tokPerByte > 1.2 && !emissionShapeAlerted) {
+              emissionShapeAlerted = true;
+              console.warn(
+                "[plan-generate] degenerate emission shape",
+                { dayIndex, tokPerByte, replyBytes },
+              );
+              void captureToSentry(
+                new Error(`day emission degenerate: tok/B=${tokPerByte}`),
+                { step: "day-emission-shape" },
+              ).catch(() => {});
+            }
+          }
+        }
         if (res.stopReason === "max_tokens") {
           // Truncated. Re-rolling at the same cap will truncate again — retry once
           // at a doubled cap (mirrors the skeleton retry) before failing the day.
           // Budget-gated like every other retry: this was the ONE retry path
           // with no canFit, so a truncating household could pay ~2x per day
           // through doomed calls the start gate had already priced out.
+          genMetrics.truncations++;
           attemptTrace.push(
             `max_tokens(${dayCap})[${replyShape(res.text, res.tokensOut)}]`,
           );
@@ -2291,9 +2365,13 @@ export async function generateMealPlan(params: {
         // tokens); expand it back to the canonical DaySlice shape — and fill
         // slot_name_ar from slot — BEFORE validation. The expander tolerates
         // canonical keys too, so an occasional non-terse meal still parses.
-        const parsed = expandTerseDaySlice(
-          JSON.parse(stripMarkdownFence(res.text)),
-        );
+        // Route by the REPLY's shape, not the flag: a model that ignores the
+        // dish-once ask and emits the per-member shape still parses, and a
+        // rogue `ds` under the terse prompt is handled rather than rejected.
+        const rawReply = JSON.parse(stripMarkdownFence(res.text));
+        const parsed = isDishOnceShape(rawReply)
+          ? expandDishOnceDaySlice(rawReply)
+          : expandTerseDaySlice(rawReply);
         const r = DaySliceSchema.safeParse(parsed);
         if (!r.success)
           throw new PlanValidationError(
@@ -2385,6 +2463,13 @@ export async function generateMealPlan(params: {
             context,
             carriedTotals,
           );
+          // Telemetry: how often the FIRST attempt lands in band — the quality
+          // gate every model/config candidate is graded against.
+          if (bandAttempt === 0 && !salvageTried) {
+            genMetrics.band_checked_days++;
+            if (calorieDevs.length === 0 && proteinDevs.length === 0)
+              genMetrics.band_first_pass++;
+          }
           if (calorieDevs.length > 0 || proteinDevs.length > 0) {
             const totalDev = normalizedDayDeviation(calorieDevs, proteinDevs);
             if (!bestOffBand || totalDev < bestOffBand.totalDev) {
@@ -2670,6 +2755,7 @@ export async function generateMealPlan(params: {
           );
           publishUsage();
         }
+        if (isTransientContentError(err)) genMetrics.schema_failures++;
         // Breadcrumb for the trace — the truncation branch already recorded
         // itself (with the reply's shape), so don't double it.
         if (!(err instanceof PlanValidationError && /hit max_tokens/.test(err.message))) {
@@ -2723,6 +2809,7 @@ export async function generateMealPlan(params: {
           salvageTried = true;
           const rescued = rescueDaySlice(salvageableText, daySkeleton, dayIndex);
           if (rescued) {
+            genMetrics.salvages++;
             attemptTrace.push(`salvaged(${rescued.members.length}m)`);
             console.warn(
               `[plan-generate] day ${dayIndex} rescued from a ${err instanceof AnthropicCallError ? "dead stream" : "truncated reply"}:`,
@@ -2820,6 +2907,9 @@ export async function generateMealPlan(params: {
       `Assembled plan failed validation: ${result.error.message.slice(0, 400)}`,
     );
   const plan: MealPlan = result.data;
+  // Telemetry rides the final plan only — progress snapshots never carry it,
+  // and translateMealPlan spreads the plan object so it survives the pass.
+  plan.gen_metrics = { ...genMetrics, model_calls: modelCallCount };
 
   // Carry-over invariant (log-only tripwire): a carried member's OWN dishes must
   // never change — adding or editing one member may update the shared BATCH a

@@ -1074,3 +1074,50 @@ the refusal instead), dayFailure.test Part G (truncation salvage), and the dayBu
 reserve≥gate + cap≤ceiling invariants. NOTE: deadline.test fixtures assume the solo
 phase-1 floor (~690s = 4 waves × 150s + 0.6×150s) — a synthetic deadline below it now
 refuses phase 1 up front, by design.
+
+**Offline stages 2/3/4 built while API credits were exhausted (08/31/2026) — INERT until the env levers flip.**
+Everything below deploys dark; the calibration session activates it. (1) **Structured
+outputs (Stage 2)**: `streamAnthropic` gained `outputFormat` → `output_config.format`
+(raw wire `{type:"json_schema", schema}`); `terseDaySliceSchema.ts` mirrors
+`expandTerseDaySlice`'s input exactly (additionalProperties:false everywhere, NO
+numeric/length keywords — zod keeps those app-side; drift pinned by its test). **CRITICAL
+DISCOVERY: claude-sonnet-4-6 does NOT support structured outputs** (same family trait as
+the prefill rejection) — supported: fable-5, opus-5/4.8, **sonnet-5**, **haiku-4-5**. So
+the day call sends a schema only when `supportsStructuredOutputs(DAY_MODEL)`, and THE
+ACTIVATION LEVER IS `PLAN_DAY_MODEL=claude-sonnet-5` in the Netlify UI — which is ALSO
+cheaper than 4.6 ($2/$10 vs $3/$15). Rollback = delete the var. (2) **gen_metrics
+telemetry**: the final plan carries `plan_data.gen_metrics` (day tok/byte list — the
+emission-mode fingerprint ~0.55 compact / ~0.97 pretty / >1.2 escaped-or-degenerate —
+truncations, schema failures, band first-pass rate, salvages, model, call census; schema
+passthrough, no migration) + a once-per-run Sentry tripwire at tok/B>1.2. This is what
+answers the STILL-OPEN question of why day emissions escalated 19k→26k→>32k across the
+08/30-31 runs (aggregates could not; the failed-day attempt-trace + reply-shape
+annotations from 75d4ab1 feed the same answer on failures). (3) **Dish-once (Stage 3)**
+behind `PLAN_DISH_ONCE=1` (default OFF): multi-member day calls emit each dish ONCE
+(`ds` array with per-sharer `ps` portion lines, amounts aligned to `ig`); prompt block +
+sharedRule variant move with the SAME flag (`systemPrompt.ts`), matching enforced schema
+(`dishOnceDaySlice.ts`), and `expandDishOnceDaySlice` fans back to the canonical
+per-member shape BEFORE zod so band/rescale/splice/resync/absence/PDF/translation see
+bytes they always saw. Routing is by REPLY shape (`ds` key), so disobedient models and
+old plans parse; `rescueDaySlice` routes the same way (the review's flagged breaker);
+misaligned portion arrays throw a re-rollable PlanValidationError (never fabricate
+quantities). Golden equivalence + truncation-fuzz + prompt-flag tests in
+`dishOnce.test.ts`. (4) **Scheduled sweeper (Stage 4)**:
+`netlify/functions/sweep-generations.mts` (cron `*/5 * * * *`) — reclassifies stale
+'started' meal rows + 'generating' plans past `STALE_GENERATION_MIN`, then dispatches
+wide refills exactly like the chain (mint rows → 23505 = someone else is healing →
+archive+yield; POST worker via `req.url`-derived URL, exactly-202, rollback). Decision
+half is PURE in `src/lib/plans/sweep.ts` (`decideSweep`, truth-table tested): onboarding
+done, no live meal run, `SWEEP_DAILY_GEN_CAP=8` recent gen rows/24h (a cron dispatching
+PAID runs must be unable to loop — free-access mode removes every other bound), ready
+plan WITH content in a 5-row window (`previousPlanFallback` semantics — after the credit
+incident the newest rows were all failed), short members under `MEMBER_GEN_MAX_ATTEMPTS`,
+NO absent beneficiary (drain keeps that routing). Max 3 dispatches per firing.
+Translation refills deliberately stay with the housekeeper page + end-of-run pass.
+QA harness: `scripts/qa-e2e/dispatch-household.mjs` (browserless dispatch — builds the
+@supabase/ssr cookie by hand; Playwright can't cross this environment's proxy) +
+`watch-generations.mjs`. **Credit-available runbook**: top up credits → set
+`PLAN_DAY_MODEL=claude-sonnet-5` → dispatch+watch one 5-member run → read gen_metrics
+(compact holding? band pass?) → if clean, set `PLAN_DISH_ONCE=1` → one more run → read
+$/person. The 08/31 credit-exhaustion run also proved the failure UX: 400s fail fast at
+$0 with the exact cause + request id in error_message.

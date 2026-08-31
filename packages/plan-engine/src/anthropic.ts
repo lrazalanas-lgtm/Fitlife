@@ -49,8 +49,16 @@ export async function streamAnthropic(params: {
   // bytes with a trailing assistant message was tried for compact-JSON
   // enforcement and REJECTED BY THE API — claude-sonnet-4-6 returns 400
   // "This model does not support assistant message prefill" (measured on
-  // production, 08/30). Compact emission rides on the prompt directive alone,
-  // and the token caps are sized so a pretty-printed reply still fits.
+  // production, 08/30). Compact emission rides on the prompt directive, and —
+  // on models that accept it — the schema-enforced `outputFormat` below.
+  //
+  // Structured outputs: sent as `output_config.format` verbatim (the raw wire
+  // shape: {type: "json_schema", schema: {...}}). The reply's text is then
+  // guaranteed valid JSON matching the schema. ONLY pass this for models in
+  // supportsStructuredOutputs — claude-sonnet-4-6 rejects it — and remember
+  // the API's constraints: additionalProperties:false on every object, no
+  // min/max-style keywords (zod keeps enforcing those app-side).
+  outputFormat?: Record<string, unknown>;
 }): Promise<StreamResult> {
   const {
     apiKey,
@@ -62,6 +70,7 @@ export async function streamAnthropic(params: {
     messages,
     onText,
     timeoutMs = 240_000,
+    outputFormat,
   } = params;
 
   const requestMessages =
@@ -98,6 +107,7 @@ export async function streamAnthropic(params: {
           system,
           messages: requestMessages,
           stream: true,
+          ...(outputFormat ? { output_config: { format: outputFormat } } : {}),
         }),
         signal: controller.signal,
       });

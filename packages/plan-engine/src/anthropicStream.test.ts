@@ -88,6 +88,33 @@ describe("the happy path", () => {
   });
 });
 
+describe("structured outputs", () => {
+  it("sends outputFormat as output_config.format, and omits it entirely when absent", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: RequestInit) => {
+        bodies.push(JSON.parse(String(init.body)));
+        return sseResponse([messageStart, delta('{"d":0,"ms":[]}'), messageDelta]);
+      }),
+    );
+    await streamAnthropic({
+      apiKey: "k",
+      model: "m",
+      maxTokens: 100,
+      systemPrompt: "s",
+      outputFormat: { type: "json_schema", schema: { type: "object", additionalProperties: false, properties: {}, required: [] } },
+    });
+    await streamAnthropic({ apiKey: "k", model: "m", maxTokens: 100, systemPrompt: "s" });
+    expect(bodies[0]!.output_config).toEqual({
+      format: { type: "json_schema", schema: { type: "object", additionalProperties: false, properties: {}, required: [] } },
+    });
+    // Absence must be TOTAL: an explicit undefined/null output_config would be
+    // a different request shape on models that reject the feature.
+    expect("output_config" in bodies[1]!).toBe(false);
+  });
+});
+
 describe("cache traffic is real money", () => {
   it("surfaces cache tokens from message_start and prices them", async () => {
     vi.stubGlobal(

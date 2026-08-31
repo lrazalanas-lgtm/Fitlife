@@ -191,6 +191,26 @@ export const MealPlanSchema = z.object({
   // can cap completion-retries (a deterministically-failing day shows "failed"
   // and the drain advances instead of looping). Absent on older plans.
   gen_attempts: z.record(z.string(), z.number()).optional(),
+  // Per-run generation telemetry, written by the engine on the FINAL plan only
+  // (progress snapshots don't carry it). The baseline every model/config
+  // decision in the delivery plan is graded against — band pass rate, emission
+  // shape (tok/byte per day call), truncation/salvage counts — readable from
+  // plan_data with no migration and no admin surface. Passthrough so the
+  // engine can grow fields without a schema dance; absent on old plans.
+  gen_metrics: z
+    .object({
+      model: z.string().optional(),
+      structured_output: z.boolean().optional(),
+      day_tok_per_byte: z.array(z.number()).optional(),
+      truncations: z.number().optional(),
+      schema_failures: z.number().optional(),
+      band_checked_days: z.number().optional(),
+      band_first_pass: z.number().optional(),
+      salvages: z.number().optional(),
+      model_calls: z.number().optional(),
+    })
+    .passthrough()
+    .optional(),
   // Per-member history de-list: member_ids for whom this plan is hidden from
   // their Previous Plans view. Does NOT affect other members' access or the
   // active plan. Absent on older plans.
