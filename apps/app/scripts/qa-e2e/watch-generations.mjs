@@ -42,7 +42,7 @@ for (;;) {
       .join("/");
     const gm = p.plan_data?.gen_metrics;
     console.log(
-      `${now} plan ${p.id.slice(0, 8)} ${p.status} days:${fill || "-"}${gm ? ` tok/B:[${(gm.day_tok_per_byte ?? []).join(",")}] band:${gm.band_first_pass}/${gm.band_checked_days} trunc:${gm.truncations} salv:${gm.salvages}` : ""}`,
+      `${now} plan ${p.id.slice(0, 8)} ${p.status} days:${fill || "-"}${gm ? ` tok/B:[${(gm.day_tok_per_byte ?? []).join(",")}] band:${gm.band_first_pass}/${gm.band_checked_days} trunc:${gm.truncations} salv:${gm.salvages} atw:${gm.atwater_repairs ?? 0}/${gm.atwater_unrepairable ?? 0}` : ""}`,
     );
   }
   console.log("---");

@@ -1149,3 +1149,32 @@ cache-cost threading reached the workout + chat accruals. The lesson that keeps
 repeating: the code that runs with NOBODY watching (cron, chain, rollback) is exactly
 the code that must be reviewed as if it will misfire at the worst boundary — because at
 5-minute cadence, it will find that boundary within a day.
+
+**Atwater guard — a day's macros must account for its own calories (08/2026).** Two
+production screenshots of ONE member's day pill: both pinned to «2300 سعرة · 173
+بروتين · 51 دهون», one with 288g carbs (4·173+4·288+9·51 = 2303 — consistent) and one
+with 241g (= 2115 — 185 kcal no macro accounts for). Possible because the model states
+`calories` AND `macros` per meal and nothing reconciled them: `sumDayTotal` sums each
+column independently, the band pins calories (±10%) and protein (±7%) only, and the
+deterministic rescale scales everything by one factor — which PRESERVES an inconsistency.
+`packages/plan-engine/src/atwater.ts` now repairs it at parse time: when
+|kcal − (4p+4c+9f)| exceeds max(20 kcal, 5%), CARBS is rewritten to the residual
+(kcal − 4p − 9f)/4 — calories are the enforced figure and protein is band-checked, so
+carbs is the residual by construction, exactly how nutrition targets are conventionally
+derived; a meal whose protein+fat alone exceed its stated calories has no honest carbs
+fix and is left untouched, counted + logged (never fabricate). The tolerance floor exists
+because integer rounding ≈ ±7 kcal and fiber bookkeeping (~2 kcal/g, not carbs' 4) can
+honestly put kcal ~20 below the 4/4/9 sum. Wired in TWO places: the day loop right after
+the slice parses (before band/rescale/splice/shared-assembly, so bestOffBand and
+day_total see reconciled numbers — salvaged slices re-enter the same path; the uniform
+rescale preserves consistency, so once per attempt suffices), and `withCalorieFloor`
+(after the floor, whose raise path scales uniformly), which both header mints flow
+through — so the customer-visible target AND the target the day prompt states to the
+model are self-consistent (asking for 2300 kcal alongside macros summing to 2115 is a
+contradiction the model can only resolve by drifting one of the two, a plausible CAUSE
+of the drift). `gen_metrics` gained `atwater_repairs`/`atwater_unrepairable` (counted
+per attempt); watch-generations.mjs prints them as `atw:R/U`. Engine-only: STORED plans
+keep their inconsistency until regenerated — display surfaces read `day_total` as
+written. Guarded by `atwater.test.ts` (the screenshot figures are the header regression
+fixture). The bg function needed no mirror change — the day loop and header minting live
+in the engine.

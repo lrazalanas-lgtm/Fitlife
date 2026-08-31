@@ -37,6 +37,7 @@ import {
   type StreamResult,
 } from "./anthropic";
 import { applyCalorieFloor, type CalorieFloorSubject } from "./calorieFloor";
+import { reconcileSliceAtwater, reconcileTargetMacros } from "./atwater";
 import {
   STATIC_SYSTEM,
   buildSkeletonPrompt,
@@ -1672,6 +1673,11 @@ export async function generateMealPlan(params: {
     band_checked_days: 0,
     band_first_pass: 0,
     salvages: 0,
+    // Meal emissions whose stated calories and 4/4/9 macro sum disagreed
+    // beyond tolerance — counted per ATTEMPT (a re-rolled day can add twice),
+    // since each is a model emission that needed reconciling.
+    atwater_repairs: 0,
+    atwater_unrepairable: 0,
   };
   let emissionShapeAlerted = false;
 
@@ -1910,11 +1916,16 @@ export async function generateMealPlan(params: {
         `[plan-generate] calorie floor raised ${memberId} from ${floored.raisedFrom} to ${floored.daily_calories_target} kcal — check the upstream target computation`,
       );
     }
-    return {
+    // Reconcile the header's macros against its own calorie figure (carbs as
+    // the residual — atwater.ts). Both call sites flow through here, so the
+    // customer-visible header AND the targets the day prompt states to the
+    // model stay self-consistent; an inconsistent prompt target is a
+    // contradiction the model can only resolve by drifting one of the two.
+    return reconcileTargetMacros({
       ...targets,
       daily_calories_target: floored.daily_calories_target,
       macros_target: floored.macros_target,
-    };
+    });
   };
 
   // Day grid: the family's (when carrying over) else the skeleton's own.
@@ -2378,6 +2389,29 @@ export async function generateMealPlan(params: {
             res.text,
           );
         let slice = r.data;
+
+        // Atwater guard: the model states calories AND macros per meal, and
+        // nothing downstream reconciles them — the band pins calories and
+        // protein while carbs/fat ride along unchecked, so two runs of one day
+        // shipped identical enforced numbers with carbs differing by 47g (a
+        // 2300-kcal pill whose macros summed to 2115). Carbs is rewritten to
+        // the residual of the stated calories (see atwater.ts for why carbs
+        // and why this tolerance). Runs BEFORE the band checks, rescale and
+        // splice so every downstream consumer — bestOffBand, shared-meal
+        // assembly, day_total — sees reconciled numbers; the uniform rescale
+        // preserves consistency, so once per attempt is enough.
+        {
+          const rec = reconcileSliceAtwater(slice);
+          if (rec.repaired > 0 || rec.unrepairable > 0) {
+            genMetrics.atwater_repairs += rec.repaired;
+            genMetrics.atwater_unrepairable += rec.unrepairable;
+            console.warn(
+              `[plan-generate] day ${dayIndex} Atwater reconciliation:`,
+              rec.notes.join("; "),
+            );
+          }
+          slice = rec.slice;
+        }
 
         // The day each member will actually END UP with, reconstructed the same
         // way the splice below does it: the out-of-scope meals carried verbatim
