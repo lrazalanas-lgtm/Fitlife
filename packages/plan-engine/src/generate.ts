@@ -300,7 +300,10 @@ export function retryWaitMs(attempt: number, retryAfterMs?: number): number {
  */
 export function normalizeDayErrorClass(msg: string): string {
   if (msg === BUDGET_DEFERRED_CAUSE) return "deferred (no model call)";
-  const m = msg.replace(/ \((?:no partial output|salvage:[^)]*)\)$/, "");
+  const m = msg.replace(
+    /(?: \((?:no partial output|salvage:[^)]*|trace:[^)]*)\))+$/,
+    "",
+  );
   let x: RegExpMatchArray | null;
   if ((x = m.match(/hit max_tokens \((\d+)\)/))) return `max_tokens(${x[1]})`;
   if (/stream timeout/i.test(m)) return "stream timeout";
@@ -1628,6 +1631,9 @@ export async function generateMealPlan(params: {
   // made" for a run that made ~11, because the summary was a plurality vote
   // and the census was nowhere.
   let modelCallCount = 0;
+  // First failed day's full annotated record (class + attempt trace + reply
+  // shape) — the specimen the class histogram cannot carry.
+  let firstDayFailureDetail: string | null = null;
 
   let skeleton: PlanSkeleton;
   if (needsSkeleton.length > 0) {
@@ -2199,6 +2205,23 @@ export async function generateMealPlan(params: {
     let apiAttempt = 0; // 429/529/5xx/overload/stream/timeout retries (honor Retry-After)
     let contentAttempt = 0; // re-rolls for a one-off malformed/invalid model response
     let bandAttempt = 0; // re-rolls (with corrective note) for out-of-band day calories/protein
+    // Content-free breadcrumbs of what this day actually went through, recorded
+    // into the failure annotation. Aggregates could not answer why the 08/31
+    // run's five 32k-truncations also burned five follow-up calls — the trace
+    // makes the next failed run self-explaining without another guess.
+    const attemptTrace: string[] = [];
+    // Reply SHAPE, never content: byte size, tokens-per-byte (the emission-mode
+    // fingerprint: ~0.55 compact, ~0.97 pretty, >1.5 = Unicode-escaped Arabic
+    // or degenerate repetition), how it opens, escape and newline counts.
+    const replyShape = (text: string, tokensOut: number): string => {
+      const bytes = new TextEncoder().encode(text).length;
+      const uEsc = (text.match(/\\u[0-9a-fA-F]{4}/g) ?? []).length;
+      const nl = (text.match(/\n/g) ?? []).length;
+      const first = text.trimStart()[0] ?? "";
+      const head =
+        first === "{" ? "brace" : first === "[" ? "bracket" : first === "`" ? "fence" : "prose";
+      return `${Math.round(bytes / 1024)}kB,tok/B=${bytes > 0 ? (tokensOut / bytes).toFixed(2) : "?"},starts=${head},uEsc=${uEsc},nl=${nl}`;
+    };
     let bestOffBand: { slice: DaySlice; totalDev: number } | null = null;
     let tokensRetried = false; // one doubled-cap retry on truncation
     // A day rescued from a timed-out stream, waiting to go through the SAME
@@ -2247,6 +2270,9 @@ export async function generateMealPlan(params: {
           // Budget-gated like every other retry: this was the ONE retry path
           // with no canFit, so a truncating household could pay ~2x per day
           // through doomed calls the start gate had already priced out.
+          attemptTrace.push(
+            `max_tokens(${dayCap})[${replyShape(res.text, res.tokensOut)}]`,
+          );
           if (
             !tokensRetried &&
             dayCap < MAX_OUTPUT_TOKENS &&
@@ -2369,15 +2395,23 @@ export async function generateMealPlan(params: {
             // already have (that fallback is what `bestOffBand` is for) and
             // leave the budget to days that have no answer at all. Chasing a
             // few percent of calorie drift is not worth losing a day over.
+            // A SALVAGED day never buys a fresh re-roll: the day already cost a
+            // full call, the re-roll re-risks the same death (measured 08/31:
+            // five salvaged days each burned a second ~$0.30 call and the runs
+            // still shipped nothing), and the deterministic rescale below is
+            // exactly the backstop built for an off-target salvage.
             if (
+              !salvageTried &&
               bandAttempt < CONTENT_MAX_RETRIES &&
               canFit(deadlineMs, retryWaitMs(bandAttempt + 1) + dayCallCost)
             ) {
               bandAttempt++;
+              attemptTrace.push("band-reroll");
               prompt = `${basePrompt}\n\n${buildDayCorrectiveNote(calorieDevs, proteinDevs)}`;
               await sleep(retryWaitMs(bandAttempt));
               continue;
             }
+            attemptTrace.push("band-accept-closest");
             console.warn(
               `[plan-generate] day ${dayIndex} calories/protein out of band after ${bandAttempt} corrective re-rolls — accepting closest attempt`,
               [
@@ -2636,6 +2670,13 @@ export async function generateMealPlan(params: {
           );
           publishUsage();
         }
+        // Breadcrumb for the trace — the truncation branch already recorded
+        // itself (with the reply's shape), so don't double it.
+        if (!(err instanceof PlanValidationError && /hit max_tokens/.test(err.message))) {
+          attemptTrace.push(
+            normalizeDayErrorClass(err instanceof Error ? err.message : String(err)),
+          );
+        }
         // (1) API-transient (rate limit / overload / timeout): retry honoring Retry-After.
         // The wait itself can be up to 60s, so the budget has to cover the sleep
         // AND the call after it — a retry we can't see through is dead time that
@@ -2682,6 +2723,7 @@ export async function generateMealPlan(params: {
           salvageTried = true;
           const rescued = rescueDaySlice(salvageableText, daySkeleton, dayIndex);
           if (rescued) {
+            attemptTrace.push(`salvaged(${rescued.members.length}m)`);
             console.warn(
               `[plan-generate] day ${dayIndex} rescued from a ${err instanceof AnthropicCallError ? "dead stream" : "truncated reply"}:`,
               rescued.members.map((m) => m.member_id).join(", "),
@@ -2689,6 +2731,11 @@ export async function generateMealPlan(params: {
             salvagedSlice = rescued;
             continue;
           }
+          attemptTrace.push(
+            salvageTruncatedJson(salvageableText) == null
+              ? "salvage-null(nothing-whole)"
+              : "salvage-null(no-complete-member)",
+          );
         }
         // The recorded error is the only diagnostic that reaches the database
         // (console output lives in the function logs), so say whether the
@@ -2709,8 +2756,16 @@ export async function generateMealPlan(params: {
               : salvageTruncatedJson(salvageableText) == null
                 ? `${base} (salvage: nothing whole streamed)`
                 : `${base} (salvage: no complete member)`;
-        console.error("[plan-generate] day failed (omitting)", dayIndex, msg);
-        dayErrors.push(msg);
+        const traced =
+          attemptTrace.length > 0
+            ? `${msg} (trace: ${attemptTrace.join("\u2192")})`
+            : msg;
+        console.error("[plan-generate] day failed (omitting)", dayIndex, traced);
+        dayErrors.push(traced);
+        // One full specimen survives into the run's row: the first failed
+        // day's class + trace + reply shape. The histogram says WHAT died;
+        // this says HOW, without another instrumented redeploy.
+        firstDayFailureDetail ??= traced.slice(0, 280);
         failedDays.add(dayIndex);
         emit();
         return;
@@ -2754,7 +2809,7 @@ export async function generateMealPlan(params: {
   if (done.size === 0 && nothingCarried) {
     const cause = summarizeDayErrors(dayErrors);
     throw new PlanValidationError(
-      `All ${genDayCount} day generations failed${cause ? ` — ${cause}` : ""} [${modelCallCount} model call${modelCallCount === 1 ? "" : "s"}]`,
+      `All ${genDayCount} day generations failed${cause ? ` — ${cause}` : ""} [${modelCallCount} model call${modelCallCount === 1 ? "" : "s"}]${firstDayFailureDetail ? ` | first: ${firstDayFailureDetail}` : ""}`,
     );
   }
 
@@ -2908,7 +2963,7 @@ export async function generateMealPlan(params: {
     // on a run that made ~11).
     missingDaysCause:
       dayErrors.length > 0
-        ? `${summarizeDayErrors(dayErrors)} [${modelCallCount} model call${modelCallCount === 1 ? "" : "s"}]`
+        ? `${summarizeDayErrors(dayErrors)} [${modelCallCount} model call${modelCallCount === 1 ? "" : "s"}]${firstDayFailureDetail ? ` | first: ${firstDayFailureDetail}` : ""}`
         : "",
     daysCompleted: done.size,
   };
