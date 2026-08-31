@@ -144,7 +144,13 @@ export async function POST(request: Request) {
             model: PLAN_MODEL,
             tokens_in: result.tokensIn,
             tokens_out: result.tokensOut,
-            cost_usd: computeCostUsd(result.tokensIn, result.tokensOut, PLAN_MODEL),
+            cost_usd: computeCostUsd(
+              result.tokensIn,
+              result.tokensOut,
+              PLAN_MODEL,
+              result.cacheCreationTokens,
+              result.cacheReadTokens,
+            ),
           });
         } catch (logErr) {
           console.error("[chat] usage log failed", logErr);

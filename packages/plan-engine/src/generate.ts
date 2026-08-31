@@ -73,6 +73,7 @@ import { isChildByAge } from "./childRule";
 import { riyadhTodayISO, khaleejiDayName } from "./dates";
 import { canonicalRecipeKey } from "./canonicalRecipeKey";
 import { captureToSentry } from "./sentryReport";
+import { SLOT_NAME_AR } from "./slotNames";
 import { terseDaySliceOutputFormat } from "./terseDaySliceSchema";
 import {
   isDishOnceShape,
@@ -95,16 +96,10 @@ export interface GenerateResult {
   };
 }
 
-// Static slot → Arabic label. The day prompt no longer asks the model to echo
-// slot_name_ar (a per-meal token cost for a value derivable from `slot`); we fill
-// it here. Both snacks collapse to "سناك" — the morning/evening snack nuance the
-// skeleton might carry is not worth re-emitting on every meal.
-const SLOT_NAME_AR: Record<string, string> = {
-  breakfast: "الفطور",
-  lunch: "الغداء",
-  dinner: "العشاء",
-  snack: "سناك",
-};
+// Slot → Arabic label lives in slotNames.ts (ONE definition — the dish-once
+// expander fills the same field, and the two emission modes must label a slot
+// identically or the golden equivalence breaks). The day prompt no longer asks
+// the model to echo slot_name_ar; we fill it here.
 
 /**
  * Expand a TERSE-keyed day slice (the compact JSON the day prompt asks for, to cut
@@ -308,10 +303,14 @@ export function retryWaitMs(attempt: number, retryAfterMs?: number): number {
  */
 export function normalizeDayErrorClass(msg: string): string {
   if (msg === BUDGET_DEFERRED_CAUSE) return "deferred (no model call)";
-  const m = msg.replace(
-    /(?: \((?:no partial output|salvage:[^)]*|trace:[^)]*)\))+$/,
-    "",
-  );
+  // The trace is stripped FIRST and greedily to end-of-string — its breadcrumbs
+  // contain parens (max_tokens(32000)[...], salvaged(2m)), so a lazy [^)]*
+  // stops inside them, the strip fails, and trace text like "stream timeout"
+  // gets classified — re-fragmenting the exact histogram this function exists
+  // to keep whole (caught by the 08/31 code review, verified by execution).
+  const m = msg
+    .replace(/ \(trace: .*\)$/, "")
+    .replace(/(?: \((?:no partial output|salvage:[^)]*)\))+$/, "");
   let x: RegExpMatchArray | null;
   if ((x = m.match(/hit max_tokens \((\d+)\)/))) return `max_tokens(${x[1]})`;
   if (/stream timeout/i.test(m)) return "stream timeout";

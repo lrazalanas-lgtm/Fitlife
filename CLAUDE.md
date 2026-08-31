@@ -1121,3 +1121,31 @@ QA harness: `scripts/qa-e2e/dispatch-household.mjs` (browserless dispatch — bu
 (compact holding? band pass?) → if clean, set `PLAN_DISH_ONCE=1` → one more run → read
 $/person. The 08/31 credit-exhaustion run also proved the failure UX: 400s fail fast at
 $0 with the exact cause + request id in error_message.
+
+**Pre-credit adversarial review of the whole 08/30-31 diff (08/31/2026): 9 confirmed
+findings, all fixed the same day.** The unattended-healing machinery held four of them:
+(1) the sweeper judged staleness on created_at/started_at with a bound EQUAL to the run
+budget, so a cron firing every 5 min would reclassify a still-live ~15.5-min run and
+dispatch a duplicate — staleness is now judged on the PLAN row's updated_at (bumped
+every emit) with a 3-min margin, and gen rows are swept only when their plan went quiet
+too; (2) the chain/sweeper enqueue-rollback could be RESURRECTED by a child that started
+before the rollback landed — closed threefold: the ACK write is now COUNTED and a
+zero-row match stands the child down ($0), and every progress/terminal write filters
+`status=neq.archived` / `status=eq.started`; (3) the sweeper pass could outrun its
+synchronous-function budget (three serial 8s enqueue aborts) — one dispatch per firing,
+5s enqueue timeout, bounded plan_data fetches, and the platform-kill residual (~18-min
+orphan lock until the next firing sweeps it) is documented instead of denied; (4) the
+cheap gates were re-inlined next to `decideSweep` and the daily cap counted
+workout/translation rows — `decideSweepCheap` is now the ONE implementation and all
+counts are meal-kind. Elsewhere: `normalizeDayErrorClass`'s lazy trace-strip broke on
+parens INSIDE breadcrumbs (verified by execution — trace text like "stream timeout"
+became the class; greedy strip now runs first, regression-tested); `sweep.ts` reached
+the engine via the bare workspace specifier a function bundle must not use (relative
+paths now, per the netlify.toml esbuild note); deriving `bigCallTimeoutMs` from the
+MEAL cap silently cut workout expansions 240s→205s (workout keeps its own explicit
+curve); the two new QA scripts re-pasted creds discovery + the password (import
+creds.mjs); SLOT_NAME_AR existed twice (now slotNames.ts, one definition). Plus
+cache-cost threading reached the workout + chat accruals. The lesson that keeps
+repeating: the code that runs with NOBODY watching (cron, chain, rollback) is exactly
+the code that must be reviewed as if it will misfire at the worst boundary — because at
+5-minute cadence, it will find that boundary within a day.

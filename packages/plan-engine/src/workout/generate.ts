@@ -1,12 +1,21 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { streamAnthropic, stripMarkdownFence, computeCostUsd } from "../anthropic";
+
+// Workout calls keep the PRE-08/31 timeout curve on purpose. bigCallTimeoutMs
+// is now DERIVED from the MEAL day cap at the meal-measured 65 tok/s, which
+// silently cut the solo workout expansion's ceiling 240s → ~205s — a rebalance
+// nobody measured on workout emissions (caught by the 08/31 code review). The
+// meal-side derivation exists to keep the meal cap/ceiling pair consistent;
+// workouts have their own cap (dayMaxTokens floor) and their own emission
+// profile, so they keep their own explicit bound.
+const workoutCallTimeoutMs = (trainees: number): number =>
+  Math.min(600_000, 240_000 + 40_000 * Math.max(0, trainees - 2));
 import {
   SKELETON_MODEL,
   DAY_MODEL,
   planModelLabel,
   skeletonMaxTokens,
   dayMaxTokens,
-  bigCallTimeoutMs,
 } from "../constants";
 import { GenerationInFlightError, PlanValidationError } from "../errors";
 import { isRetryable, retryWaitMs, MAX_RETRIES } from "../generate";
@@ -232,11 +241,17 @@ export async function generateWorkoutPlan(params: {
         maxTokens: skeletonMaxTokens(trainees.length),
         systemStatic: WORKOUT_STATIC,
         systemPrompt: skeletonPrompt,
-        timeoutMs: bigCallTimeoutMs(trainees.length),
+        timeoutMs: workoutCallTimeoutMs(trainees.length),
       });
       totalIn += res.tokensIn;
       totalOut += res.tokensOut;
-      totalCost += computeCostUsd(res.tokensIn, res.tokensOut, SKELETON_MODEL);
+      totalCost += computeCostUsd(
+        res.tokensIn,
+        res.tokensOut,
+        SKELETON_MODEL,
+        res.cacheCreationTokens,
+        res.cacheReadTokens,
+      );
       reportUsage();
 
       const parsed = WorkoutSkeletonSchema.safeParse(
@@ -288,11 +303,17 @@ export async function generateWorkoutPlan(params: {
           maxTokens: dayMaxTokens(1),
           systemStatic: WORKOUT_STATIC,
           systemPrompt: buildWorkoutMemberPrompt(context, skeleton, trainee.member_id),
-          timeoutMs: bigCallTimeoutMs(1),
+          timeoutMs: workoutCallTimeoutMs(1),
         });
         totalIn += res.tokensIn;
         totalOut += res.tokensOut;
-        totalCost += computeCostUsd(res.tokensIn, res.tokensOut, DAY_MODEL);
+        totalCost += computeCostUsd(
+          res.tokensIn,
+          res.tokensOut,
+          DAY_MODEL,
+          res.cacheCreationTokens,
+          res.cacheReadTokens,
+        );
         reportUsage();
 
         const parsed = MemberWorkoutSchema.safeParse(

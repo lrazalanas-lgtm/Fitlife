@@ -135,6 +135,29 @@ async function sbUpdate(
   }
 }
 
+/** Like sbUpdate, but reports how many rows the PATCH matched — for writes
+ * whose zero-row outcome is a SIGNAL (a rolled-back child, a settled row),
+ * not a success. */
+async function sbUpdateCounted(
+  base: string,
+  serviceKey: string,
+  table: string,
+  filter: string,
+  patch: Record<string, unknown>,
+): Promise<number> {
+  const res = await fetch(`${base}/rest/v1/${table}?${filter}`, {
+    method: "PATCH",
+    headers: { ...sbHeaders(serviceKey), prefer: "return=representation" },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`PostgREST update ${table} → ${res.status} ${text}`);
+  }
+  const rows = (await res.json().catch(() => [])) as unknown[];
+  return Array.isArray(rows) ? rows.length : 0;
+}
+
 /** Defensive jsonb parse — malformed workout_profile means "not opted in". */
 function parseWorkoutProfileLoose(v: unknown) {
   if (v == null) return undefined;
@@ -265,10 +288,13 @@ async function sbInsertReturning(
  * as a real silent failure mode, and req.url is correct by construction.
  *
  * On ANY enqueue failure — non-202 or an exception (the 8s abort included) —
- * roll back: archive the child plan row, fail its gen row. This is safe even if
- * the POST actually WAS enqueued and the abort was just slow plumbing: a late-
- * starting child hits its idempotency probe, finds the archived/failed rows,
- * and no-ops ("Already settled"). What must NOT be copied here is dispatch.ts's
+ * roll back: archive the child plan row, fail its gen row. Safe even if the
+ * POST actually WAS enqueued: a late-starting child no-ops at its idempotency
+ * probe, and a child that started BEFORE the rollback landed is caught by two
+ * further guards (08/31 review) — the counted ACK write stands the child down
+ * when its row is no longer 'generating', and every progress/terminal write
+ * filters status=neq.archived / status=eq.started, so a rolled-back child can
+ * never resurrect its archive. What must NOT be copied here is dispatch.ts's
  * "timeout = probably enqueued" optimism — the app-side dispatcher has a user
  * watching a spinner and a sweeper to clean up; a leaked orphan lock from a
  * background hop has neither, it just blocks the household's next run for 90s+.
@@ -1011,13 +1037,25 @@ const handler = async (req: Request): Promise<Response> => {
   // arrive in. Not wrapped in a swallowing try — a worker that cannot write this
   // cannot persist a result later either, so failing loudly beats running a full
   // generation whose output has nowhere to go.
-  await sbUpdate(
+  const ackRows = await sbUpdateCounted(
     supabaseUrl,
     serviceKey,
     "meal_plans",
     `id=eq.${mealPlanId}&status=eq.generating`,
     { plan_data: { worker_ack_at: new Date().toISOString() } },
   );
+  // Zero rows = the row is no longer 'generating' — a chain/sweeper rollback
+  // archived it in the enqueue window, or a concurrent healer settled it. The
+  // idempotency probe ran before the rollback landed, so THIS check is what
+  // actually closes the race: without it the run spends real money writing a
+  // plan whose terminal writes then match nothing — or worse, used to
+  // resurrect an archived row (08/31 code-review finding).
+  if (ackRows === 0) {
+    console.log("[generate-plan-background] row left 'generating' before ACK — standing down", {
+      mealPlanId,
+    });
+    return new Response(JSON.stringify({ ok: true, settled: true }), { status: 200 });
+  }
 
   const startMs = Date.now();
   // Netlify kills this function at its budget without running any catch, so the
@@ -1150,11 +1188,13 @@ const handler = async (req: Request): Promise<Response> => {
       // Persist progressively + flip "ready" on the first emit (the shell), so
       // the plan opens showing all days as loading and they fill in 1→7.
       onProgress: async (snapshot) => {
+        // neq.archived: a rolled-back child's progress writes must not
+        // resurrect the archive (same guard as the terminal writes).
         await sbUpdate(
           supabaseUrl,
           serviceKey,
           "meal_plans",
-          `id=eq.${mealPlanId}`,
+          `id=eq.${mealPlanId}&status=neq.archived`,
           { status: "ready", plan_data: snapshot },
         );
       },
@@ -1260,7 +1300,18 @@ const handler = async (req: Request): Promise<Response> => {
       console.warn(`[generate-plan-background] ${partialNote}`, { userId, mealPlanId });
     }
 
-    await sbUpdate(supabaseUrl, serviceKey, "meal_plans", `id=eq.${mealPlanId}`, {
+    // `status=neq.archived` / `status=eq.started`: a chain/sweeper rollback in
+    // the enqueue window archives the child and fails its gen row — an
+    // unconditional terminal write here would RESURRECT that archive as the
+    // household's newest plan (08/31 code-review finding). The ACK-time bail
+    // catches the common case; these filters catch a rollback that lands
+    // mid-run.
+    await sbUpdate(
+      supabaseUrl,
+      serviceKey,
+      "meal_plans",
+      `id=eq.${mealPlanId}&status=neq.archived`,
+      {
       status: "ready",
       plan_data: finalPlan,
       generated_at: generatedAt,
@@ -1272,7 +1323,7 @@ const handler = async (req: Request): Promise<Response> => {
       supabaseUrl,
       serviceKey,
       "plan_generations",
-      `meal_plan_id=eq.${mealPlanId}`,
+      `meal_plan_id=eq.${mealPlanId}&status=eq.started`,
       {
         status: "completed",
         tokens_in: usage.input_tokens + extraIn,
@@ -1361,7 +1412,12 @@ const handler = async (req: Request): Promise<Response> => {
     // kept the message, so the stack and the failing step were unrecoverable.
     await captureToSentry(err, { step: "meal-generation", userId, mealPlanId });
     try {
-      await sbUpdate(supabaseUrl, serviceKey, "meal_plans", `id=eq.${mealPlanId}`, {
+      await sbUpdate(
+        supabaseUrl,
+        serviceKey,
+        "meal_plans",
+        `id=eq.${mealPlanId}&status=neq.archived`,
+        {
         status: "failed",
         error_message: errorMessage,
       });
@@ -1369,7 +1425,7 @@ const handler = async (req: Request): Promise<Response> => {
         supabaseUrl,
         serviceKey,
         "plan_generations",
-        `meal_plan_id=eq.${mealPlanId}`,
+        `meal_plan_id=eq.${mealPlanId}&status=eq.started`,
         {
           status: "failed",
           error_message: errorMessage,
@@ -1393,7 +1449,12 @@ const handler = async (req: Request): Promise<Response> => {
       // and report either way.
       console.error("[generate-plan-background] failed to mark rows failed", updateErr);
       try {
-        await sbUpdate(supabaseUrl, serviceKey, "meal_plans", `id=eq.${mealPlanId}`, {
+        await sbUpdate(
+          supabaseUrl,
+          serviceKey,
+          "meal_plans",
+          `id=eq.${mealPlanId}&status=neq.archived`,
+          {
           status: "failed",
           error_message: errorMessage,
         });

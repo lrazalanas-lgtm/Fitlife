@@ -1,29 +1,20 @@
-// Usage: node dispatch-household.mjs
+// Usage: node dispatch-household.mjs [email]
+//
 // Dispatch a whole-household generation WITHOUT a browser: sign in via
 // supabase-js, encode the session the way @supabase/ssr's cookie storage does
-// (base64url JSON with "base64-" prefix, chunked), and POST the generate route
-// with those cookies.
+// ("base64-" + base64url JSON, chunked), and POST the generate route with
+// those cookies. Exists because Playwright cannot cross some CI/remote
+// proxies; credentials come from creds.mjs like every other diagnostic here.
 import { createClient } from "@supabase/supabase-js";
+import { discoverSupabaseCreds, BASE, PASSWORD } from "./creds.mjs";
 
-const BASE = "https://fitlife-app-mvp.netlify.app";
-const html = await (await fetch(`${BASE}/auth/login`)).text();
-const scripts = [...html.matchAll(/src="([^"]+\.js)"/g)].map((m) => m[1]);
-let url = null, anon = null;
-for (const s of scripts) {
-  const t = await (await fetch(s.startsWith("http") ? s : BASE + s)).text();
-  url ??= t.match(/https:\/\/[a-z0-9-]+\.supabase\.co/)?.[0] ?? null;
-  for (const tok of t.match(/eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g) ?? []) {
-    try { if (JSON.parse(Buffer.from(tok.split(".")[1], "base64url").toString()).role === "anon") anon = tok; } catch {}
-  }
-  if (url && anon) break;
-}
-if (!url || !anon) throw new Error("no creds discovered");
+const EMAIL = process.argv[2] ?? process.env.QA_EMAIL ?? "fitlife.qa+brief-tkkuc@gmail.com";
+
+const { url, anon } = await discoverSupabaseCreds();
 const ref = new URL(url).hostname.split(".")[0];
 const sb = createClient(url, anon, { auth: { persistSession: false } });
-const { data, error } = await sb.auth.signInWithPassword({
-  email: "fitlife.qa+brief-tkkuc@gmail.com", password: "FitLifeQA!2026",
-});
-if (error) throw new Error(error.message);
+const { data, error } = await sb.auth.signInWithPassword({ email: EMAIL, password: PASSWORD });
+if (error) throw new Error(`sign-in failed: ${error.message}`);
 
 const raw = "base64-" + Buffer.from(JSON.stringify(data.session)).toString("base64url");
 const CHUNK = 3180;
@@ -36,10 +27,12 @@ if (raw.length <= CHUNK) {
 }
 const cookieHeader = cookies.join("; ");
 
-// Sanity: does the app see us as signed in?
 const st = await fetch(`${BASE}/api/plans/status`, { headers: { cookie: cookieHeader } });
 console.log("status probe →", st.status);
-if (st.status !== 200) { console.log(await st.text()); process.exit(1); }
+if (st.status !== 200) {
+  console.log(await st.text());
+  process.exit(1);
+}
 
 const r = await fetch(`${BASE}/api/plans/generate`, {
   method: "POST",

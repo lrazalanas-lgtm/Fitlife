@@ -162,6 +162,14 @@ describe("summarizeDayErrors", () => {
       "5x max_tokens(32000); 2x deferred (no model call)",
     );
   });
+  it("strips a trace whose breadcrumbs contain parens — trace text must never classify", () => {
+    // Verified-by-execution review finding: the lazy [^)]* strip stopped at
+    // the ')' inside max_tokens(40000), the strip failed, and the trace's
+    // "stream timeout" breadcrumb became the class.
+    const msg =
+      "Day 3 failed validation: macros wrong (trace: stream timeout\u2192max_tokens(40000)[20kB,tok/B=1.60,starts=brace,uEsc=9000,nl=0]\u2192schema validation failed)";
+    expect(summarizeDayErrors([msg])).toBe("1x schema validation failed");
+  });
   it("strips day indices and timing figures from stream errors", () => {
     expect(
       summarizeDayErrors([

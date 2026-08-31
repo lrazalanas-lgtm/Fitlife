@@ -27,6 +27,7 @@
  */
 
 import { PlanValidationError } from "./errors";
+import { SLOT_NAME_AR } from "./slotNames";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyRecord = Record<string, any>;
@@ -39,12 +40,7 @@ export function isDishOnceShape(raw: unknown): boolean {
   );
 }
 
-const SLOT_NAME_AR: Record<string, string> = {
-  breakfast: "الفطور",
-  lunch: "الغداء",
-  dinner: "العشاء",
-  snack: "سناك",
-};
+
 
 /**
  * Fan a dish-once reply out to the canonical per-member day slice. Tolerant of

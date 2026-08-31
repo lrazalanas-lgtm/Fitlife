@@ -29,19 +29,31 @@ import { MealPlanSchema } from "../../../../packages/plan-engine/src/schema";
 import type { MealPlan } from "../../../../packages/plan-engine/src/schema";
 import {
   decideSweep,
-  SWEEP_DAILY_GEN_CAP,
+  decideSweepCheap,
   SWEEP_PLAN_WINDOW,
-  type SweepCandidate,
 } from "../../src/lib/plans/sweep";
 import { STALE_GENERATION_MIN } from "../../src/lib/plans/generationTiming";
 
 export const config = { schedule: "*/5 * * * *" };
 
-// At most this many dispatches per firing — the cron runs again in 5 minutes,
-// and gentleness beats throughput for a background healer.
-const MAX_DISPATCHES_PER_SWEEP = 3;
-// How many users a single firing examines (newest activity first).
+// ONE dispatch per firing. This is a SYNCHRONOUS scheduled function (seconds
+// of runtime, not minutes): the cron fires again in 5 minutes, and a single
+// bounded dispatch keeps the whole pass safely inside the platform limit —
+// three serial 8s enqueue timeouts would not (08/31 code-review finding).
+const MAX_DISPATCHES_PER_SWEEP = 1;
+// How many users a single firing examines (newest activity first)…
 const MAX_CANDIDATES_PER_SWEEP = 20;
+// …and how many of those may pay the plan_data jsonb fetch. Cheap gates run
+// first; this bounds the expensive tail so the pass cannot crawl.
+const MAX_PLAN_FETCHES_PER_SWEEP = 6;
+// Reclassification margin ABOVE the 15-minute staleness bound. A healthy run
+// legitimately lands terminal writes at ~15.5 min (budget + finalize reserve +
+// dispatch latency), and a cron that fires every 5 minutes WILL hit the exact
+// boundary a dispatch-time sweep only hits by coincidence — reclassifying a
+// still-live run releases its lock and buys a concurrent duplicate run
+// (08/31 code-review finding). Liveness is judged on the PLAN row's
+// updated_at, which a live run bumps on every emit.
+const SWEEP_STALE_MARGIN_MS = 3 * 60_000;
 
 const sbHeaders = (serviceKey: string) => ({
   apikey: serviceKey,
@@ -129,34 +141,65 @@ const handler = async (req: Request): Promise<Response> => {
 
   try {
     // ── 1. Reclassify wreckage the dispatch-time sweeps never saw ──
-    // A 'started' row past the staleness bound is dead by the same verdict
-    // resolveStaleness reaches read-side (the ACK subtleties only matter
-    // inside the first minutes); until now the reclassify only ran when
-    // somebody DISPATCHED — one stale row sat 94 hours in the history.
-    const staleIso = new Date(
-      Date.now() - STALE_GENERATION_MIN * 60_000,
+    // Until now the reclassify only ran when somebody DISPATCHED — one stale
+    // row sat 94 hours in the history. Liveness is judged on the PLAN row's
+    // updated_at (bumped on every emit), never on created_at/started_at alone:
+    // a healthy run's timestamps are its dispatch time, and a cron firing
+    // every 5 minutes is guaranteed to catch the boundary minute a live run is
+    // still finishing in.
+    const staleBoundIso = new Date(
+      Date.now() - STALE_GENERATION_MIN * 60_000 - SWEEP_STALE_MARGIN_MS,
     ).toISOString();
-    summary.staleGenRows = await sbPatch(
-      supabaseUrl,
-      serviceKey,
-      "plan_generations",
-      `status=eq.started&plan_kind=eq.meal&started_at=lt.${staleIso}`,
-      {
-        status: "failed",
-        error_message: "stale generation reclassified (sweeper)",
-        completed_at: new Date().toISOString(),
-      },
-    );
     summary.stalePlans = await sbPatch(
       supabaseUrl,
       serviceKey,
       "meal_plans",
-      `status=eq.generating&created_at=lt.${staleIso}`,
+      `status=eq.generating&updated_at=lt.${staleBoundIso}`,
       {
         status: "failed",
         error_message: "worker never finished (sweeper reclassify)",
       },
     );
+    // Gen rows: candidates by started_at, VERDICT by their plan's updated_at —
+    // a stuck lock row whose plan went quiet is swept; a lock row whose plan
+    // is still being written is live, whatever the clock says.
+    const staleGenCandidates = (await sbSelect(
+      supabaseUrl,
+      serviceKey,
+      "plan_generations",
+      `select=id,meal_plan_id&status=eq.started&plan_kind=eq.meal&started_at=lt.${staleBoundIso}&limit=25`,
+    )) as Array<{ id: string; meal_plan_id: string | null }>;
+    if (staleGenCandidates.length > 0) {
+      const planIds = staleGenCandidates
+        .map((g) => g.meal_plan_id)
+        .filter((id): id is string => id != null);
+      const freshPlans =
+        planIds.length > 0
+          ? await sbSelect(
+              supabaseUrl,
+              serviceKey,
+              "meal_plans",
+              `select=id&id=in.(${planIds.join(",")})&updated_at=gte.${staleBoundIso}`,
+            )
+          : [];
+      const fresh = new Set(freshPlans.map((p) => p.id as string));
+      const dead = staleGenCandidates.filter(
+        (g) => g.meal_plan_id == null || !fresh.has(g.meal_plan_id),
+      );
+      if (dead.length > 0) {
+        summary.staleGenRows = await sbPatch(
+          supabaseUrl,
+          serviceKey,
+          "plan_generations",
+          `id=in.(${dead.map((g) => g.id).join(",")})&status=eq.started`,
+          {
+            status: "failed",
+            error_message: "stale generation reclassified (sweeper)",
+            completed_at: new Date().toISOString(),
+          },
+        );
+      }
+    }
 
     // ── 2. Candidates: users with recent meal-plan activity ──
     const recentPlans = (await sbSelect(
@@ -201,33 +244,39 @@ const handler = async (req: Request): Promise<Response> => {
       profiles.map((p) => [p.id as string, p.onboarding_completed_at != null]),
     );
 
+    let planFetches = 0;
     for (const userId of userIds) {
       if (summary.dispatched >= MAX_DISPATCHES_PER_SWEEP) break;
+      if (planFetches >= MAX_PLAN_FETCHES_PER_SWEEP) break;
       summary.examined++;
       const window = byUser.get(userId)!;
-      const gens = recentGens.filter((g) => g.user_id === userId);
+      // MEAL kind only, for the cap AND the lock check: a household's workout
+      // runs and translation passes must neither consume the healer's budget
+      // nor read as the meal lock (08/31 code-review finding).
+      const mealGens = recentGens.filter(
+        (g) => g.user_id === userId && (g.plan_kind ?? "meal") === "meal",
+      );
       // Date.parse, never string comparison: PostgREST timestamps come back
       // "+00:00"-suffixed while ours are "Z"-suffixed, and lexicographic
-      // comparison across the two formats is quietly wrong.
-      const liveBound = Date.now() - STALE_GENERATION_MIN * 60_000;
-      const hasLiveMealRun = gens.some(
+      // comparison across the two formats is quietly wrong. Same margined
+      // bound as the reclassify above — a run inside it is LIVE.
+      const liveBound =
+        Date.now() - STALE_GENERATION_MIN * 60_000 - SWEEP_STALE_MARGIN_MS;
+      const hasLiveMealRun = mealGens.some(
         (g) =>
           g.status === "started" &&
-          (g.plan_kind ?? "meal") === "meal" &&
           Date.parse(String(g.started_at)) >= liveBound,
       );
-      // Cheap gates first — only a survivor pays the plan_data fetch.
-      const cheap: SweepCandidate = {
-        userId,
+      // Cheap gates first — the ONE shared implementation, so the logged
+      // reason and the actual skip can never drift apart.
+      const cheapInputs = {
         onboardingCompleted: onboardingByUser.get(userId) ?? false,
-        planWindow: window,
-        newestReadyPlan: null,
-        beneficiaryIds: [],
         hasLiveMealRun,
-        genRowsLast24h: gens.length,
+        genRowsLast24h: mealGens.length,
       };
-      if (!cheap.onboardingCompleted || hasLiveMealRun || gens.length >= SWEEP_DAILY_GEN_CAP) {
-        summary.skipped.push(`${userId.slice(0, 8)}: ${decideSweep(cheap).reason}`);
+      const cheapVerdict = decideSweepCheap(cheapInputs);
+      if (cheapVerdict) {
+        summary.skipped.push(`${userId.slice(0, 8)}: ${cheapVerdict.reason}`);
         continue;
       }
       const readyRow = window.find((p) => p.status === "ready");
@@ -235,6 +284,7 @@ const handler = async (req: Request): Promise<Response> => {
         summary.skipped.push(`${userId.slice(0, 8)}: no ready plan in window`);
         continue;
       }
+      planFetches++;
       const planRows = await sbSelect(
         supabaseUrl,
         serviceKey,
@@ -249,7 +299,9 @@ const handler = async (req: Request): Promise<Response> => {
           .map((m) => m.id as string),
       ];
       const decision = decideSweep({
-        ...cheap,
+        userId,
+        planWindow: window,
+        ...cheapInputs,
         newestReadyPlan: parsed.success ? (parsed.data as MealPlan) : null,
         beneficiaryIds,
       });
@@ -259,6 +311,11 @@ const handler = async (req: Request): Promise<Response> => {
       }
 
       // ── 3. Dispatch — the chain's hand-off protocol, verbatim ──
+      // Residual, stated honestly: a platform kill between the lock claim
+      // below and the rollback leaves an orphan 'started' row holding the
+      // per-kind lock until the NEXT firing's stale pass sweeps it (~18 min).
+      // The rollback is best-effort, not a guarantee — which is why the pass
+      // is sized to finish in seconds and dispatches at most once.
       const childId = crypto.randomUUID();
       const planIns = await sbInsert(supabaseUrl, serviceKey, "meal_plans", {
         id: childId,
@@ -301,7 +358,7 @@ const handler = async (req: Request): Promise<Response> => {
           },
           body: JSON.stringify({ userId, mealPlanId: childId, carryOver: true }),
           redirect: "manual",
-          signal: AbortSignal.timeout(8000),
+          signal: AbortSignal.timeout(5000),
         });
         enqueued = res.status === 202;
         if (!enqueued) console.error("[sweep] enqueue got", res.status);
