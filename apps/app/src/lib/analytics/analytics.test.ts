@@ -33,17 +33,25 @@ function installWindow(stored?: string) {
   return store;
 }
 
+type Analytics = typeof import("./index");
+let current: Analytics | null = null;
+
 /** Fresh module per test — the module keeps init state in closure scope. */
 async function loadModule() {
   vi.resetModules();
-  return import("./index");
+  current = await import("./index");
+  return current;
 }
 
 // The lazy `import("posthog-js")` settles on the module runner's own schedule,
-// not the microtask queue — draining ticks is not enough and lets an init land
-// during the NEXT test, which reads as "the wrong test initialised". A short
-// real-time wait is the honest way to let it finish.
-const flush = () => new Promise((r) => globalThis.setTimeout(r, 50));
+// not the microtask queue — draining ticks is not enough. This used to be a
+// fixed 50ms wait, which under CPU load let one test's init land during the
+// NEXT test (read as "the wrong test initialised"). Wait for the module's own
+// settle signal instead, then one macrotask for the `.then` handlers.
+const flush = async () => {
+  await current?.whenAnalyticsSettled();
+  await new Promise((r) => globalThis.setTimeout(r, 0));
+};
 
 describe("analytics consent gate", () => {
   const OLD_KEY = process.env.NEXT_PUBLIC_POSTHOG_KEY;
@@ -56,7 +64,10 @@ describe("analytics consent gate", () => {
     process.env.NEXT_PUBLIC_POSTHOG_KEY = "phc_test";
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // Drain any load this test started so it cannot fire into the next one.
+    await flush();
+    current = null;
     delete (globalThis as { window?: unknown }).window;
     if (OLD_KEY === undefined) delete process.env.NEXT_PUBLIC_POSTHOG_KEY;
     else process.env.NEXT_PUBLIC_POSTHOG_KEY = OLD_KEY;
@@ -128,6 +139,28 @@ describe("analytics consent gate", () => {
 
     a.setAnalyticsConsent(false);
     expect(posthogMock.opt_out_capturing).toHaveBeenCalledTimes(1);
+  });
+
+  // The SDK is ~50KB and lazy-loaded after idle; on a phone the download can
+  // outlast a change of mind. Withdrawing consent found no client to opt out,
+  // so the import used to land, initialise, and start capturing (page-leave
+  // events included) for a user who had just said no — and re-accepting could
+  // never recover, because loadStarted was already set.
+  it("does not initialise an SDK whose consent was withdrawn while it was loading", async () => {
+    installWindow("accepted");
+    const a = await loadModule();
+
+    a.initPostHog(); // import in flight
+    a.setAnalyticsConsent(false); // change of mind before it lands
+    await flush();
+
+    expect(posthogMock.init).not.toHaveBeenCalled();
+    expect(posthogMock.capture).not.toHaveBeenCalled();
+
+    // And the module is not wedged: a later accept still initialises.
+    a.setAnalyticsConsent(true);
+    await flush();
+    expect(posthogMock.init).toHaveBeenCalledTimes(1);
   });
 
   it("records the choice so the banner is not asked again", async () => {

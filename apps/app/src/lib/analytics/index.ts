@@ -110,6 +110,26 @@ export function initPostHog() {
   const load = () =>
     import("posthog-js")
       .then(({ default: posthog }) => {
+        // Consent can be withdrawn while the ~50KB SDK is still downloading:
+        // setAnalyticsConsent(false) found no client to opt out, so without
+        // this check the import lands, initialises, and starts capturing —
+        // page-leave events included — for a user who just said no; and a
+        // later accept could never recover, because loadStarted was already
+        // set. `pending === null` is exactly what the refusal writes and
+        // nothing else clears it mid-flight. Hand the module back to its
+        // pre-load state so a later accept re-runs initPostHog from scratch.
+        if (pending === null) {
+          if (posthog.__loaded) {
+            try {
+              posthog.opt_out_capturing();
+            } catch {
+              // never break the UX
+            }
+          }
+          loadStarted = false;
+          loadPromise = null;
+          return;
+        }
         if (!posthog.__loaded) {
           posthog.init(key, {
             api_host:
@@ -142,6 +162,16 @@ export function initPostHog() {
       window.setTimeout(run, 2000);
     }
   });
+}
+
+/**
+ * Resolves once any in-flight SDK load has settled (immediately when none is).
+ * captureBeacon races this internally; exported so tests can wait for the
+ * real settle instead of guessing a delay — a fixed wait let one test's init
+ * land during the next test under CPU load.
+ */
+export function whenAnalyticsSettled(): Promise<void> {
+  return loadPromise ?? Promise.resolve();
 }
 
 // ─── Capture ──────────────────────────────────────────────────────────────
