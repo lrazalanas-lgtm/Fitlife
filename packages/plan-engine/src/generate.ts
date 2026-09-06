@@ -3181,7 +3181,13 @@ export async function runMealPlanGeneration(params: {
         tokens_out: accrued.output_tokens,
         cost_usd: accrued.cost_usd,
       })
-      .eq("meal_plan_id", mealPlanId);
+      .eq("meal_plan_id", mealPlanId)
+      // A translation pass's audit row shares this meal_plan_id (there is no
+      // 'translation' plan_kind — it borrows the meal lock on purpose), so a
+      // write keyed by plan alone would also rewrite that row's tokens and
+      // cost with this run's. Only the row this run opened is still 'started'
+      // — the same filter the production worker uses.
+      .eq("status", "started");
 
     await supabase
       .from("meal_plans")
@@ -3307,7 +3313,9 @@ export async function runMealPlanGeneration(params: {
       completed_at: generatedAt,
       error_message: partialNote,
     })
-    .eq("meal_plan_id", mealPlanId);
+    .eq("meal_plan_id", mealPlanId)
+    // See the failure-path write above: never touch a sibling translation row.
+    .eq("status", "started");
 
   if (updateGenError) {
     console.error(
