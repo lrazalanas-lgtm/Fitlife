@@ -11,7 +11,8 @@
  * member, and for the family-wide list.
  */
 import { describe, it, expect } from "vitest";
-import { buildSkeletonPrompt } from "./systemPrompt";
+import { buildSkeletonPrompt, buildDayPrompt } from "./systemPrompt";
+import type { PlanSkeleton } from "./schema";
 import type {
   PlanPromptContext,
   PlanPromptContextMom,
@@ -226,5 +227,74 @@ describe("medical conditions reach the prompt in Arabic", () => {
     // condition the model cannot name is still one it must respect.
     const out = prompt(ctx({ mom: mom({ medical_conditions: ["صداع نصفي مزمن"] }) }));
     expect(out).toContain("صداع نصفي مزمن");
+  });
+});
+
+/**
+ * The DAY call is the one that writes ingredients. The August fix above
+ * reached only the skeleton roster: the day prompt still said «حالات: ibs»
+ * and never mentioned an individual's dietary restriction at all, so لبنة
+ * kept landing on a lactose-free member's plate with the roster fixed.
+ */
+describe("the day prompt carries the same rules as the roster", () => {
+  const skeletonFor = (memberIds: string[]): PlanSkeleton => ({
+    members: memberIds.map((id) => ({
+      member_id: id,
+      member_name_ar: id === "mom" ? "هند" : "سارة",
+      primary_goal: "fat_loss",
+      daily_calories_target: 1600,
+      macros_target: { protein_g: 100, carbs_g: 140, fat_g: 55 },
+      days: [
+        {
+          day_index: 0,
+          day_name_ar: "اليوم 1",
+          meals: [{ slot: "breakfast", slot_name_ar: "فطور", recipe_name_ar: "بيض" }],
+        },
+      ],
+    })),
+    methodology_notes_ar: "ملاحظات",
+    safety_disclaimer_ar: "تنبيه",
+  });
+
+  it("names the owner's condition in Arabic, not the slug", () => {
+    const out = buildDayPrompt(
+      ctx({ mom: mom({ medical_conditions: ["ibs"] }) }),
+      skeletonFor(["mom"]),
+      0,
+    );
+    expect(out).toContain("متلازمة القولون العصبي");
+    expect(out).not.toContain("ibs");
+  });
+
+  it("carries the owner's OWN dietary restriction as a binding rule", () => {
+    const out = buildDayPrompt(
+      ctx({ mom: mom({ dietary_restrictions: ["lactose_free"] }) }),
+      skeletonFor(["mom"]),
+      0,
+    );
+    expect(out).toContain("قيود غذائية ملزمة");
+    expect(out).toContain("خالٍ من اللاكتوز");
+    expect(out).not.toContain("lactose_free");
+  });
+
+  it("carries a family member's own restriction and condition", () => {
+    const out = buildDayPrompt(
+      ctx({
+        family_members: [
+          member({ dietary_restrictions: ["lactose_free"], medical_conditions: ["pcos"] }),
+        ],
+      }),
+      skeletonFor(["mom", "m1"]),
+      0,
+    );
+    expect(out).toContain("تكيس المبايض");
+    expect(out).not.toContain("pcos");
+    expect(out).toContain("خالٍ من اللاكتوز");
+    expect(out).not.toContain("lactose_free");
+  });
+
+  it("says nothing about restrictions when there are none", () => {
+    const out = buildDayPrompt(ctx(), skeletonFor(["mom"]), 0);
+    expect(out).not.toContain("قيود غذائية ملزمة");
   });
 });

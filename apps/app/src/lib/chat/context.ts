@@ -5,7 +5,7 @@ import {
   getCurrentUserProfile,
   getCurrentUserFamilyMembers,
 } from "@/lib/supabase/queries";
-import { getLatestPlan } from "@/lib/plans/getLatestPlan";
+import { getCookablePlan } from "@/lib/plans/getLatestPlan";
 import { applyMemberDisplayNames } from "@/lib/plans/memberNames";
 import {
   CUISINE_AR,
@@ -96,11 +96,17 @@ function planSummary(plan: MealPlan): string {
  * to stay inside the token budget.
  */
 export async function buildHouseholdContext(userId: string): Promise<string> {
-  const [profile, family, latest] = await Promise.all([
+  // The COOKABLE plan, not the newest row: every dispatch mints a placeholder
+  // row with empty plan_data that stays 'generating' through the whole
+  // skeleton phase, and getLatestPlan reported that as "no plan" while a
+  // complete week sat one row back — the advisor then told a household with a
+  // ready plan that it had none. Same read the housekeeper page uses.
+  const [profile, family, cookable] = await Promise.all([
     getCurrentUserProfile(),
     getCurrentUserFamilyMembers(),
-    getLatestPlan(userId),
+    getCookablePlan(userId),
   ]);
+  const latest = cookable?.plan ?? null;
 
   const sections: string[] = [];
 
@@ -109,7 +115,7 @@ export async function buildHouseholdContext(userId: string): Promise<string> {
   if (profile) {
     sections.push(
       [
-        "صاحبة الحساب:",
+        `${profile.sex === "male" ? "صاحب الحساب" : "صاحبة الحساب"}:`,
         `- الاسم: ${profile.display_name ?? "غير محدد"}`,
         ...measurements(profile),
         `- الهدف: ${label(GOAL_AR, profile.primary_goal)}`,
@@ -166,7 +172,16 @@ export async function buildHouseholdContext(userId: string): Promise<string> {
   // Superlatives and ordinals ("الأصغر", "الأكبر", "الثاني") were being answered
   // by picking, not comparing. Precompute the order so there is nothing to infer.
   const ageOrder = ageOrderLine([
-    ...(profile ? [{ name: profile.display_name ?? "صاحبة الحساب", birth_year: profile.birth_year }] : []),
+    ...(profile
+      ? [
+          {
+            name:
+              profile.display_name ??
+              (profile.sex === "male" ? "صاحب الحساب" : "صاحبة الحساب"),
+            birth_year: profile.birth_year,
+          },
+        ]
+      : []),
     ...beneficiaries.map((m) => ({ name: m.name, birth_year: m.birth_year })),
   ]);
   if (ageOrder) sections.push(ageOrder);
@@ -183,6 +198,11 @@ export async function buildHouseholdContext(userId: string): Promise<string> {
         }),
       ),
     );
+    if (cookable?.superseded) {
+      sections.push(
+        "ملاحظة: يجري الآن إعداد خطة أسبوع جديد؛ الخطة أعلاه هي الخطة الحالية المعتمدة حتى تكتمل الجديدة.",
+      );
+    }
   } else {
     sections.push("لا توجد خطة حالية جاهزة بعد.");
   }

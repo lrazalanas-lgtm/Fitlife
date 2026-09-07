@@ -98,6 +98,7 @@ export default async function SettingsPage() {
           email={user.email ?? ""}
           signupDate={user.created_at}
           subscription={subscription}
+          ownerSex={ownerSex}
         />
 
         <DataSection userEmail={user.email ?? ""} ownerSex={ownerSex} />
@@ -106,7 +107,7 @@ export default async function SettingsPage() {
 
         <PrivacyChoiceCard ownerSex={ownerSex} />
 
-        <SupportSection />
+        <SupportSection ownerSex={ownerSex} />
       </div>
     </main>
   );

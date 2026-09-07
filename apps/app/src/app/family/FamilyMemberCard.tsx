@@ -21,6 +21,10 @@ const GOAL_LABELS: Record<string, string> = {
   digestive_health: "صحة الجهاز الهضمي",
   pregnancy_lactation: "الحمل والرضاعة",
   posture_recovery: "القوام والتعافي",
+  // Promoted to first-class goals in the 07/2026 questionnaire rework; both
+  // are reachable from ordinary UI choices and rendered as a blank line here.
+  maintain: "ثبات الوزن",
+  general_health: "الصحة العامة",
 };
 
 export function FamilyMemberCard({

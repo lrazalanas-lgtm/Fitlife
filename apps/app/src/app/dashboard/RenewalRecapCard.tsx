@@ -2,6 +2,7 @@ import Link from "next/link";
 import { CalendarHeart } from "lucide-react";
 
 import type { FamilyLedger } from "@/lib/engagement/ledger";
+import { genderPick } from "@/lib/copy/gender";
 
 const AR_NUM = new Intl.NumberFormat("ar-SA", { useGrouping: false });
 const DATE_FMT = new Intl.DateTimeFormat("ar-SA-u-ca-gregory", {
@@ -19,10 +20,13 @@ const DATE_FMT = new Intl.DateTimeFormat("ar-SA-u-ca-gregory", {
 export function RenewalRecapCard({
   ledger,
   cadence,
+  ownerSex,
 }: {
   ledger: FamilyLedger;
   cadence: string | null;
+  ownerSex?: string | null;
 }) {
+  const g = genderPick(ownerSex);
   if (ledger.planWeeks === 0) return null;
 
   const sinceLabel = ledger.since
@@ -47,7 +51,7 @@ export function RenewalRecapCard({
           href="/subscription#change-plan"
           className="flex-shrink-0 inline-flex items-center justify-center min-h-11 px-5 rounded-full bg-brand-purple-900 text-white hover:bg-brand-purple-700 text-sm font-bold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-purple-900 focus-visible:ring-offset-2 focus-visible:ring-offset-brand-surface"
         >
-          بدّلي للسنوي — وفّري ٢٠٪
+          {g("بدّلي للسنوي — وفّري ٢٠٪", "بدّل للسنوي — وفّر ٢٠٪")}
         </Link>
       ) : (
         <Link

@@ -1083,9 +1083,25 @@ export function buildDayPrompt(
         sm.member_id === "mom"
           ? context.mom.medical_conditions
           : (ctxMember?.medical_conditions ?? []);
+      // A member's OWN dietary restriction (lactose_free, gluten_free…) used to
+      // reach only the skeleton roster — the day call, the one that actually
+      // writes ingredients, was never told, so لبنة kept landing on a
+      // lactose-free member's plate after the August roster fix. Same rule
+      // text as the roster line; family-wide restrictions ride familyWideText.
+      const dietaryRestrictions =
+        sm.member_id === "mom"
+          ? context.mom.dietary_restrictions
+          : (ctxMember?.dietary_restrictions ?? []);
       if (allergies.length) constraints.push(`حساسية (تجنّب تام): ${allergies.join("، ")}`);
       if (dislikes.length) constraints.push(`لا يحب: ${dislikes.join("، ")}`);
-      if (conditions.length) constraints.push(`حالات: ${conditions.join("، ")}`);
+      if (dietaryRestrictions.length)
+        constraints.push(`قيود غذائية ملزمة: ${restrictionRules(dietaryRestrictions)}`);
+      // Arabic labels, not the stored slugs: the roster line was fixed to say
+      // «متلازمة القولون العصبي», this line still said «ibs».
+      if (conditions.length)
+        constraints.push(
+          `حالات: ${conditionLabels(conditions)} — طبّقي قواعد الحالة الصحية في المنهجية.`,
+        );
       // Meds + nausea are per-meal-relevant (timing / temporary aversions), so
       // they repeat in every day prompt; everything else questionnaire-related
       // stays skeleton-only for token economy.

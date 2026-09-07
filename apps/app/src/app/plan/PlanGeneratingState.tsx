@@ -8,6 +8,7 @@ import {
   WORKER_ACK_LIMIT_MS,
   generationHasStalled,
 } from "@/lib/plans/generationTiming";
+import { classifyStatusPoll } from "@/lib/plans/statusPoll";
 
 const POLL_INTERVAL_MS = 3000;
 // Generation runs one concurrent Anthropic call per family member; the slowest
@@ -39,6 +40,9 @@ export function PlanGeneratingState({
 }) {
   const g = genderPick(ownerSex);
   const [timedOut, setTimedOut] = useState(false);
+  // The run this tab started failed empty and the server is serving the
+  // previous plan instead (string = its error detail, "" = none).
+  const [maskedFailure, setMaskedFailure] = useState<string | null>(null);
   const [isLong, setIsLong] = useState(false);
   const [progress, setProgress] = useState(6);
   const [stepIndex, setStepIndex] = useState(0);
@@ -90,8 +94,19 @@ export function PlanGeneratingState({
             id: string;
             status: string;
             age_ms?: number;
+            masked_failure?: { id: string; error_message: string | null } | null;
           };
-          if (body.id !== planId) {
+          const verdict = classifyStatusPoll(body, planId);
+          if (verdict === "masked_failure") {
+            // The run THIS tab started failed with nothing to show, and the
+            // server is serving the previous plan under its own id. Say so —
+            // reading the id mismatch as "superseded" reloaded onto the old
+            // week with no word said anywhere.
+            stopTimers();
+            setMaskedFailure(body.masked_failure?.error_message ?? "");
+            return;
+          }
+          if (verdict === "superseded") {
             // A newer plan superseded the one this tab is watching (add-member
             // sync, a second generation). The status route only ever reports the
             // latest, so this tab can never see its own plan finish — reload and
@@ -158,6 +173,37 @@ export function PlanGeneratingState({
       stopTimers();
     };
   }, [planId]);
+
+  if (maskedFailure !== null) {
+    return (
+      <div className="max-w-md mx-auto bg-white rounded-3xl border border-brand-ink/5 p-8 text-center">
+        <h1 className="font-extrabold text-xl text-brand-ink leading-tight">
+          لم تكتمل الخطة الجديدة
+        </h1>
+        <p className="mt-3 text-brand-ink-muted text-sm leading-relaxed">
+          {g(
+            "آخر محاولة لم تكتمل، وخطتك السابقة ما زالت كما هي. جرّبي مرة أخرى بعد قليل.",
+            "آخر محاولة لم تكتمل، وخطتك السابقة ما زالت كما هي. جرّب مرة أخرى بعد قليل.",
+          )}
+        </p>
+        {maskedFailure && (
+          <details className="mt-3 text-xs text-brand-ink-muted text-start">
+            <summary className="cursor-pointer">تفاصيل تقنية</summary>
+            <p dir="ltr" className="mt-1 break-words text-start">
+              {maskedFailure}
+            </p>
+          </details>
+        )}
+        <button
+          type="button"
+          onClick={() => window.location.reload()}
+          className="mt-6 inline-flex items-center justify-center w-full bg-brand-ink hover:bg-brand-purple-900 text-white font-bold py-3 rounded-xl transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-purple-900 focus-visible:ring-offset-2 focus-visible:ring-offset-brand-surface"
+        >
+          {g("اعرضي خطتي السابقة", "اعرض خطتي السابقة")}
+        </button>
+      </div>
+    );
+  }
 
   if (timedOut) {
     return (

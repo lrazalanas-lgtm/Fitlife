@@ -1,4 +1,5 @@
 import { UserRound } from "lucide-react";
+import { genderPick } from "@/lib/copy/gender";
 import {
   getTrialDaysRemaining,
   type SubscriptionRow,
@@ -58,11 +59,14 @@ export function AccountInfoCard({
   email,
   signupDate,
   subscription,
+  ownerSex,
 }: {
   email: string;
   signupDate: string;
   subscription: SubscriptionRow | null;
+  ownerSex?: string | null;
 }) {
+  const g = genderPick(ownerSex);
   const badge = subscription ? statusBadge(subscription.status) : null;
 
   return (
@@ -80,7 +84,7 @@ export function AccountInfoCard({
             {email}
           </span>
         </Row>
-        <Row label="عضوة منذ">{DATE_FMT.format(new Date(signupDate))}</Row>
+        <Row label={g("عضوة منذ", "عضو منذ")}>{DATE_FMT.format(new Date(signupDate))}</Row>
         {subscription ? (
           <>
             <Row label="الاشتراك">{planLine(subscription)}</Row>

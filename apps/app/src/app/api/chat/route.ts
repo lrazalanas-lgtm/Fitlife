@@ -14,6 +14,8 @@ import { hasAdvisorAccess } from "@/lib/subscription/access";
 import { buildHouseholdContext } from "@/lib/chat/context";
 import { CHAT_SYSTEM_STATIC, buildChatSystemPrompt } from "@/lib/chat/systemRules";
 import { dailyCapMessage } from "@/lib/chat/capMessage";
+import { chatDailyCap } from "@/lib/chat/dailyCap";
+import { trimChatHistory } from "@/lib/chat/history";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -34,11 +36,7 @@ export const maxDuration = 60;
  * it is sold to. Env-overridable so it can be tuned without a deploy, matching
  * PLAN_DAY_CONCURRENCY / PLAN_RUN_BUDGET_MS.
  */
-const DEFAULT_DAILY_CAP = 100;
-function dailyCap(): number {
-  const n = Number(process.env.CHAT_DAILY_CAP?.trim());
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_DAILY_CAP;
-}
+const dailyCap = chatDailyCap;
 // Cap turns sent to the model (token budget); keep the most recent.
 const MAX_HISTORY = 20;
 
@@ -115,7 +113,9 @@ export async function POST(request: Request) {
   if (parsed.messages[parsed.messages.length - 1]?.role !== "user") {
     return NextResponse.json({ error: "طلب غير صالح" }, { status: 400 });
   }
-  const history = parsed.messages.slice(-MAX_HISTORY);
+  // Last MAX_HISTORY turns, opened on a user turn — see lib/chat/history.ts
+  // for why a bare slice 400'd every request after the tenth exchange.
+  const history = trimChatHistory(parsed.messages, MAX_HISTORY);
 
   const householdContext = await buildHouseholdContext(user.id);
   const systemPrompt = buildChatSystemPrompt(householdContext);

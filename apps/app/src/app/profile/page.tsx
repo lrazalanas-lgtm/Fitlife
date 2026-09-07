@@ -9,6 +9,7 @@ import { Logo } from "@/components/Logo";
 import { BackButton } from "@/components/BackButton";
 import { SettingsLink } from "@/components/SettingsLink";
 import { ProfileEditedBanner } from "./ProfileEditedBanner";
+import { riyadhCurrentYear } from "@/lib/plans/dayMapping";
 import {
   ACTIVITY_OPTIONS,
   GOALS,
@@ -21,8 +22,6 @@ export const metadata = {
   title: "ملفي الشخصي — فت لايف",
   robots: { index: false, follow: false },
 };
-
-const currentYear = new Date().getFullYear();
 
 function SectionCard({
   href,
@@ -60,7 +59,7 @@ export default async function ProfilePage() {
   if (!profile) redirect("/onboarding");
 
   const g = genderPick(profile.sex);
-  const age = profile.birth_year ? currentYear - profile.birth_year : null;
+  const age = profile.birth_year ? riyadhCurrentYear() - profile.birth_year : null;
   const personalSummary = [
     profile.display_name,
     age ? `${age} سنة` : null,

@@ -43,5 +43,9 @@ export async function GET() {
     acked: latest.worker_acked,
     in_progress: latest.in_progress,
     error_message: latest.status === "failed" ? latest.error_message : null,
+    // The id here is the PREVIOUS plan when the newest run failed empty; this
+    // names that failed run so a tab watching it can say so instead of
+    // treating the id mismatch as "a newer plan superseded mine" and reloading.
+    masked_failure: latest.masked_failure ?? null,
   });
 }

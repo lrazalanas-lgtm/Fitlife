@@ -28,6 +28,15 @@ export interface LatestPlanSummary {
   updated_at: string;
   /** When the run that built this plan FINISHED. Null while it never has. */
   generated_at: string | null;
+  /**
+   * Set when this summary is the PREVIOUS plan served in place of a newer run
+   * that failed with nothing to show. The fallback is deliberate (a stale week
+   * beats an error screen), but it used to be invisible: a customer's own
+   * «إنشاء خطة جديدة» could fail and the old plan simply reappeared with no
+   * word said anywhere — and the generating screen, seeing a different id from
+   * the one it was watching, silently reloaded. Surfaces read this to say so.
+   */
+  masked_failure?: { id: string; error_message: string | null } | null;
 }
 
 /**
@@ -161,6 +170,10 @@ export async function getLatestPlan(userId: string): Promise<LatestPlanSummary |
             generated_at: prev.generated_at,
             // The ACK belongs to the row being served, not the failed one.
             worker_acked: workerAckedFromPlanData(prev.plan_data),
+            masked_failure: {
+              id: row.id,
+              error_message: resolved.errorMessage ?? row.error_message ?? null,
+            },
           };
         }
       }
@@ -179,6 +192,7 @@ export async function getLatestPlan(userId: string): Promise<LatestPlanSummary |
     error_message: resolved.errorMessage,
     updated_at: row.updated_at,
     generated_at: row.generated_at,
+    masked_failure: null,
   };
 }
 

@@ -2,6 +2,10 @@ import Link from "next/link";
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { hasAdvisorAccess } from "@/lib/subscription/access";
+import {
+  getCurrentSubscription,
+  hasLiveLemonsqueezySubscription,
+} from "@/lib/subscription/state";
 import { Logo } from "@/components/Logo";
 import { BackToDashboard } from "@/components/BackToDashboard";
 import { SettingsLink } from "@/components/SettingsLink";
@@ -20,12 +24,16 @@ export default async function ChatPage() {
   } = await supabase.auth.getUser();
   if (!user) redirect("/auth/login");
 
-  const [access, { data: ownerProfile }] = await Promise.all([
+  const [access, { data: ownerProfile }, subscription] = await Promise.all([
     hasAdvisorAccess(user.id),
     supabase.from("profiles").select("sex").eq("id", user.id).single(),
+    getCurrentSubscription(user.id),
   ]);
   const ownerSex = (ownerProfile as { sex?: string | null } | null)?.sex ?? null;
   const g = genderPick(ownerSex);
+  // A denied customer who already holds a live LemonSqueezy subscription
+  // (past_due, paused) must not be sent to /pricing — checkout 409s them.
+  const isSubscriber = hasLiveLemonsqueezySubscription(subscription);
 
   return (
     <main
@@ -58,16 +66,18 @@ export default async function ChatPage() {
               {g("المستشارة الغذائية حق المشتركات", "المستشارة الغذائية حق المشتركين")}
             </p>
             <p className="mt-2 text-brand-ink-muted text-sm leading-relaxed">
-              {g(
-                "اشتركي وسأليني مباشرة عن وجباتك وخطتك الغذائية.",
-                "اشترك وسألني مباشرة عن وجباتك وخطتك الغذائية.",
-              )}
+              {isSubscriber
+                ? "اشتراكك يحتاج تحديثاً لتعود المستشارة."
+                : g(
+                    "اشتركي وسأليني مباشرة عن وجباتك وخطتك الغذائية.",
+                    "اشترك وسألني مباشرة عن وجباتك وخطتك الغذائية.",
+                  )}
             </p>
             <Link
-              href="/pricing"
+              href={isSubscriber ? "/subscription" : "/pricing"}
               className="inline-flex items-center justify-center min-h-11 mt-4 px-5 rounded-full bg-brand-purple-900 text-white hover:bg-brand-purple-700 text-sm font-bold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-purple-900 focus-visible:ring-offset-2 focus-visible:ring-offset-brand-surface"
             >
-              عرض الباقات
+              {isSubscriber ? "إدارة الاشتراك" : "عرض الباقات"}
             </Link>
           </div>
         </div>

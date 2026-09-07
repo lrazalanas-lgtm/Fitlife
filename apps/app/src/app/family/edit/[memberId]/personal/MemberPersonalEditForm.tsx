@@ -75,7 +75,10 @@ export function MemberPersonalEditForm({
         weight_kg: weight,
       });
       if (!result.ok) return setError(result.error);
-      router.push(`/family/edit/${memberId}?saved=1`);
+      // `edited=personal`, not `saved=1`: the banner's regenerate nudge keys
+      // off it (the health form already sends `edited=health`). Weight, height,
+      // birth year and sex all change the targets the plan was built on.
+      router.push(`/family/edit/${memberId}?edited=personal`);
     });
   };
 

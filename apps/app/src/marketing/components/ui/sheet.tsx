@@ -72,8 +72,9 @@ function SheetContent({
           <SheetPrimitive.Close data-slot="sheet-close" asChild>
             <Button
               variant="ghost"
-              className="absolute top-3 end-3"
-              size="icon-sm"
+              // 44px hit area (house minimum): the icon stays small, the box does not.
+              className="absolute top-2 end-2 min-h-11 min-w-11"
+              size="icon"
             >
               <XIcon
               />

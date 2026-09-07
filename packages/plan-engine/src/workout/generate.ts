@@ -426,9 +426,18 @@ export async function runWorkoutPlanGeneration(params: {
   workoutPlanId: string;
   context: PlanPromptContext;
   weekStartDate: string;
+  /**
+   * The INVOCATION's start, not this function's. The production worker holds
+   * a workout run for up to 8 minutes while a meal run is live (meals-first),
+   * and anchoring the budget here after that wait let the run believe it had
+   * the platform's full 15 minutes when up to half were already spent — then
+   * Netlify killed it mid-call, skipping the catch and leaving both rows
+   * stuck until the staleness sweep. Omitted (dev inline path) = now.
+   */
+  startMs?: number;
 }): Promise<void> {
   const { supabase, anthropicApiKey, workoutPlanId, context, weekStartDate } = params;
-  const startMs = Date.now();
+  const startMs = params.startMs ?? Date.now();
   // Spend so far, kept outside the try so the catch can record what a failed
   // run actually cost. Previously the catch wrote status/error only, so every
   // failed workout generation was booked at $0 — and workout generation is the

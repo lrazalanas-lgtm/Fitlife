@@ -75,6 +75,7 @@ export async function GET() {
     engagementRows,
     workoutCheckins,
     mealAbsences,
+    chatMessages,
   ] = await Promise.all([
     supabase.from("profiles").select("*").eq("id", user.id).maybeSingle(),
     supabase
@@ -126,6 +127,21 @@ export async function GET() {
       try {
         const { data } = await (supabase as unknown as SupabaseClient)
           .from("meal_absences")
+          .select("*")
+          .eq("user_id", user.id)
+          .order("created_at", { ascending: false });
+        return data ?? [];
+      } catch {
+        return [];
+      }
+    })(),
+    // chat_messages holds usage metadata only (model, tokens, cost, time —
+    // never the text), but it IS the customer's data and the policy promises
+    // a complete copy. Same tolerance as the rows above.
+    (async (): Promise<unknown[]> => {
+      try {
+        const { data } = await (supabase as unknown as SupabaseClient)
+          .from("chat_messages")
           .select("*")
           .eq("user_id", user.id)
           .order("created_at", { ascending: false });
@@ -186,6 +202,7 @@ export async function GET() {
     meal_absences: mealAbsences,
     body_logs: bodyLogs,
     workout_checkins: workoutCheckins,
+    chat_messages: chatMessages,
   };
 
   const date = new Date().toISOString().slice(0, 10);

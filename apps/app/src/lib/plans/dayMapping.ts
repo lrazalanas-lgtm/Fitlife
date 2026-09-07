@@ -102,6 +102,16 @@ export function riyadhTodayISO(): string {
   return new Date(Date.now() + RIYADH_OFFSET_MS).toISOString().slice(0, 10);
 }
 
+/**
+ * The current Riyadh calendar year, evaluated per call. Ages are derived from
+ * birth_year against THIS, not against a module-scope `new Date()` — that
+ * value is fixed at the server's cold start, so a long-lived instance kept
+ * showing last year's ages after New Year.
+ */
+export function riyadhCurrentYear(): number {
+  return Number(riyadhTodayISO().slice(0, 4));
+}
+
 /** YYYY-MM-DD + n days → YYYY-MM-DD (pure calendar math, no TZ). */
 export function addDaysISO(dateISO: string, days: number): string {
   const d = new Date(`${dateISO}T00:00:00Z`);

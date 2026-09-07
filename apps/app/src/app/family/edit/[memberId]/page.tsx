@@ -10,6 +10,7 @@ import { mapSaraGoalToUser, type SaraGoal } from "@/lib/plans/goalMapping";
 import { genderPick } from "@/lib/copy/gender";
 import { HousekeeperForm } from "../../add/HousekeeperForm";
 import { MemberEditedBanner } from "./MemberEditedBanner";
+import { riyadhCurrentYear } from "@/lib/plans/dayMapping";
 import {
   ACTIVITY_OPTIONS,
   CHILD_ACTIVITY,
@@ -24,8 +25,6 @@ export const metadata = {
   title: "تعديل فرد — فت لايف",
   robots: { index: false, follow: false },
 };
-
-const currentYear = new Date().getFullYear();
 
 function SectionCard({
   href,
@@ -110,7 +109,7 @@ export default async function EditMemberPage({
     | "lactating";
 
   // ── Card summaries (mirror the mom profile hub) ──────────────────────────
-  const age = m.birth_year ? currentYear - m.birth_year : null;
+  const age = m.birth_year ? riyadhCurrentYear() - m.birth_year : null;
   const personalSummary =
     [
       age ? `${age} سنة` : null,

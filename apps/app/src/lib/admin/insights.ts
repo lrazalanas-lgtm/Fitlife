@@ -1,6 +1,11 @@
 import "server-only";
 
 import { adminDb } from "@/lib/admin/db";
+import { chatDailyCap } from "@/lib/chat/dailyCap";
+import {
+  memberRequiresDoctorSignOff,
+  ownerRequiresDoctorSignOff,
+} from "@fitlife/plan-engine";
 import { paginate } from "@/lib/admin/queries";
 import {
   getPeriodPair,
@@ -48,8 +53,9 @@ import { computeFailureBuckets, type FailureBucket } from "@/lib/admin/failures"
  * underlying condition lists).
  */
 
-// Matches the consumer chat route's per-user daily cap.
-const CHAT_DAILY_CAP = 30;
+// The consumer chat route's per-household daily cap — ONE definition, read
+// here rather than re-typed (this used to say 30 after the route moved to 100).
+const CHAT_DAILY_CAP = chatDailyCap();
 const DAY_MS = 86_400_000;
 const FAILURE_LIST_LIMIT = 50;
 
@@ -84,6 +90,7 @@ interface InsMember {
   preferred_language: string;
   high_risk_pregnancy: boolean | null;
   consulted_doctor: boolean | null;
+  medical_conditions: string[] | null;
 }
 interface InsPlan {
   user_id: string;
@@ -154,7 +161,7 @@ export async function loadInsightsDataset(): Promise<InsightsDataset> {
           db
             .from("family_members")
             .select(
-              "user_id, role, member_type, preferred_language, high_risk_pregnancy, consulted_doctor",
+              "user_id, role, member_type, preferred_language, high_risk_pregnancy, consulted_doctor, medical_conditions",
             )
             .range(f, t),
         "family_members",
@@ -432,13 +439,21 @@ export function computeOps(
     if (arr) arr.push(m);
     else membersByUser.set(m.user_id, [m]);
   }
+  // The ONE doctor-gate rule (medicalGate.ts) — this used to re-derive it by
+  // hand, and the two copies disagreed in opposite directions with detail.ts.
   const medicalGate: OpsUser[] = [];
   for (const p of ds.profiles) {
     const momGate =
-      (p.has_medical_conditions || p.is_pregnant || p.high_risk_pregnancy === true) &&
-      p.consulted_doctor !== true;
+      ownerRequiresDoctorSignOff({
+        has_medical_conditions: p.has_medical_conditions,
+        is_pregnant: p.is_pregnant,
+      }) && p.consulted_doctor !== true;
     const memberGate = (membersByUser.get(p.id) ?? []).some(
-      (m) => m.high_risk_pregnancy === true && m.consulted_doctor !== true,
+      (m) =>
+        memberRequiresDoctorSignOff({
+          medical_conditions: m.medical_conditions,
+          high_risk_pregnancy: m.high_risk_pregnancy,
+        }) && m.consulted_doctor !== true,
     );
     if (momGate || memberGate) medicalGate.push({ userId: p.id, name: nameOf(p.id) });
   }

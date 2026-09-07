@@ -1,5 +1,6 @@
 import { LifeBuoy, Mail, MessageCircle, ChevronLeft } from "lucide-react";
 import { env } from "@/lib/env";
+import { genderPick } from "@/lib/copy/gender";
 
 function ContactRow({
   href,
@@ -33,7 +34,8 @@ function ContactRow({
   );
 }
 
-export function SupportSection() {
+export function SupportSection({ ownerSex }: { ownerSex?: string | null }) {
+  const g = genderPick(ownerSex);
   const email = env.NEXT_PUBLIC_SUPPORT_EMAIL;
   const whatsapp = env.NEXT_PUBLIC_SUPPORT_WHATSAPP;
   const hasContact = Boolean(email || whatsapp);
@@ -44,7 +46,7 @@ export function SupportSection() {
         <div className="size-10 rounded-full bg-brand-lavender/30 flex items-center justify-center flex-shrink-0">
           <LifeBuoy className="size-5 text-brand-purple-900" aria-hidden="true" />
         </div>
-        <h2 className="font-bold text-lg text-brand-ink">تواصلي معنا</h2>
+        <h2 className="font-bold text-lg text-brand-ink">{g("تواصلي معنا", "تواصل معنا")}</h2>
       </div>
 
       {hasContact ? (

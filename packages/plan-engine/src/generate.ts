@@ -1683,6 +1683,12 @@ export async function generateMealPlan(params: {
 
   let skeleton: PlanSkeleton;
   if (needsSkeleton.length > 0) {
+    // A phase-1 failure never reaches snapshot(), where gen_attempts is
+    // charged — so a wide refill whose skeleton call fails deterministically
+    // was re-dispatched by the sweeper and the drain against the same wall,
+    // forever. The error carries WHO was being attempted; the production
+    // worker charges those ids on the source plan (see its catch).
+    try {
     const skeletonSystemPrompt = buildSkeletonPrompt(
       context,
       needsSkeleton.map((b) => b.member_id),
@@ -1878,6 +1884,13 @@ export async function generateMealPlan(params: {
         }
         throw wrapped;
       }
+    }
+    } catch (phase1Err) {
+      if (phase1Err && typeof phase1Err === "object") {
+        (phase1Err as { attemptedMemberIds?: string[] }).attemptedMemberIds =
+          needsSkeleton.map((b) => b.member_id);
+      }
+      throw phase1Err;
     }
   } else {
     // Pure gap-fill aligned to the family menu — no dishes to invent.

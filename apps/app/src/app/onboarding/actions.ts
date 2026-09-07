@@ -26,6 +26,7 @@ import {
   planHasContent,
   MEMBER_GEN_MAX_ATTEMPTS,
   ownerRequiresDoctorSignOff,
+  memberRequiresDoctorSignOff,
   DOCTOR_SIGN_OFF_REQUIRED_AR,
   type MealPlan,
 } from "@fitlife/plan-engine";
@@ -709,6 +710,20 @@ export async function drainDeferredMembers(): Promise<{
       // because only a completed regeneration can clear it.
       return { fired: gen.ok, busy: !gen.ok && gen.kind === "busy" };
     }
+    // A member removed while a run held the lock was never taken out of the
+    // plan: the run in flight had already captured the roster and wrote them
+    // back, and afterwards nobody was 'short' or 'pending', so nothing fired —
+    // their tab stayed indefinitely. A wide carry-over run assembles from the
+    // LIVE roster; with every live member's week carried it makes no model
+    // call, so this costs nothing but the write.
+    const liveIds = new Set((membersRes.data ?? []).map((m) => m.id));
+    const ghosts = latest.plan_data.members.filter(
+      (m) => m.member_id !== "mom" && !liveIds.has(m.member_id),
+    );
+    if (ghosts.length > 0) {
+      const gen = await runFamilyGeneration(supabase, user.id, {});
+      return { fired: gen.ok, busy: !gen.ok && gen.kind === "busy" };
+    }
     const hk = (membersRes.data ?? []).find((m) => m.role === "housekeeper");
     const locale = hk?.preferred_language;
     if (
@@ -1102,6 +1117,20 @@ export async function addFamilyMember(
   if (!parsedMember.success) {
     return { ok: false, error: firstFieldErrorAr(parsedMember.error) };
   }
+  // The member half of the ONE doctor-gate rule (medicalGate.ts), enforced
+  // server-side like saveMomProfile does for the owner. The wizard already
+  // blocks the button, but the server trusted it — and a member row that
+  // fails this gate makes buildPlanContext refuse the WHOLE household with
+  // no self-service way to clear it (confirmDoctorConsult is owner-only).
+  if (
+    memberRequiresDoctorSignOff({
+      medical_conditions: parsedMember.data.conditions ?? [],
+      high_risk_pregnancy: parsedMember.data.high_risk_pregnancy,
+    }) &&
+    !parsedMember.data.consulted_doctor
+  ) {
+    return { ok: false, error: DOCTOR_SIGN_OFF_REQUIRED_AR };
+  }
 
   // Tier limit, checked BEFORE the insert. The row used to be written first and
   // the limit consulted only afterwards, by the generation that followed — so
@@ -1368,6 +1397,9 @@ async function purgeMemberEngagementRows(
     "workout_checkins",
     "meal_absences",
     "body_logs",
+    // Keyed by the EXCEPTED member; the checkin it hangs off may belong to
+    // another member (or the household row), so the cascade never reaches it.
+    "member_exceptions",
   ] as const;
 
   for (const table of tables) {
@@ -1459,6 +1491,20 @@ export async function updateFamilyMember(
   const parsedMember = familyMemberInputSchema.safeParse(input);
   if (!parsedMember.success) {
     return { ok: false, error: firstFieldErrorAr(parsedMember.error) };
+  }
+  // The member half of the ONE doctor-gate rule (medicalGate.ts), enforced
+  // server-side like saveMomProfile does for the owner. The wizard already
+  // blocks the button, but the server trusted it — and a member row that
+  // fails this gate makes buildPlanContext refuse the WHOLE household with
+  // no self-service way to clear it (confirmDoctorConsult is owner-only).
+  if (
+    memberRequiresDoctorSignOff({
+      medical_conditions: parsedMember.data.conditions ?? [],
+      high_risk_pregnancy: parsedMember.data.high_risk_pregnancy,
+    }) &&
+    !parsedMember.data.consulted_doctor
+  ) {
+    return { ok: false, error: DOCTOR_SIGN_OFF_REQUIRED_AR };
   }
 
   const { data: beforeRow } = await supabase

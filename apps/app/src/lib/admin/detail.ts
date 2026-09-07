@@ -1,6 +1,10 @@
 import "server-only";
 
 import { PRICING_TIERS, type Tier } from "@fitlife/config";
+import {
+  memberRequiresDoctorSignOff,
+  ownerRequiresDoctorSignOff,
+} from "@fitlife/plan-engine";
 import { adminDb } from "@/lib/admin/db";
 
 /**
@@ -243,12 +247,13 @@ export async function loadSubscriberDetail(
   }
 
   // Members: owner ("mom") first, then family members.
+  // The ONE doctor-gate rule (medicalGate.ts), not a hand-rolled copy.
   const momGate =
-    (profile.has_medical_conditions === true ||
-      (profile.medical_conditions?.length ?? 0) > 0 ||
-      profile.is_pregnant === true ||
-      profile.high_risk_pregnancy === true) &&
-    profile.consulted_doctor !== true;
+    ownerRequiresDoctorSignOff({
+      has_medical_conditions: profile.has_medical_conditions,
+      medical_conditions: profile.medical_conditions,
+      is_pregnant: profile.is_pregnant,
+    }) && profile.consulted_doctor !== true;
 
   const momGoal = goalByMember.get("mom");
   const momMember: MemberSummary = {
@@ -268,8 +273,10 @@ export async function loadSubscriberDetail(
   const familyMembers: MemberSummary[] = (membersRes.data ?? []).map((m) => {
     const g = goalByMember.get(m.id);
     const memberGate =
-      ((m.medical_conditions?.length ?? 0) > 0 || m.high_risk_pregnancy === true) &&
-      m.consulted_doctor !== true;
+      memberRequiresDoctorSignOff({
+        medical_conditions: m.medical_conditions,
+        high_risk_pregnancy: m.high_risk_pregnancy,
+      }) && m.consulted_doctor !== true;
     return {
       id: m.id,
       name: m.name,

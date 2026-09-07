@@ -33,6 +33,9 @@ export const GATE_CONDITIONS: ConditionOption[] = [
   { slug: "eating_disorder", label_ar: "اضطراب في الأكل" },
   { slug: "post_surgical", label_ar: "ما بعد عملية جراحية" },
   { slug: "bariatric_surgery", label_ar: "جراحة سمنة سابقة" },
+  // In HIGH_RISK_MEDICAL_FLAGS (Sara's «أي أعراض غير مفسّرة تحتاج تشخيصاً»)
+  // but had no chip, so the gate list carried a condition nobody could select.
+  { slug: "unexplained_symptoms", label_ar: "أعراض غير مفسّرة تحتاج تشخيصاً" },
 ];
 
 /** Stable / managed — inform the plan, never gate it. */

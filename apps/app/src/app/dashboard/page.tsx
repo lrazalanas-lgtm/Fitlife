@@ -5,6 +5,8 @@ import { AddFamilyBanner } from "./AddFamilyBanner";
 import { DeepDiveBanner } from "./DeepDiveBanner";
 import { PlanCTA, type PlanCTAState } from "./PlanCTA";
 import { WorkoutOptInBanner } from "./WorkoutOptInBanner";
+import { WorkoutPlanCard } from "./WorkoutPlanCard";
+import { staleMemberIds } from "@/lib/plans/memberEdit";
 import { DeferredMemberDrain } from "../plan/DeferredMemberDrain";
 import { FamilySeasonCard } from "../plan/FamilySeasonCard";
 import {
@@ -15,7 +17,10 @@ import {
 import { getLatestWorkoutPlan } from "@/lib/plans/getLatestWorkoutPlan";
 import { planHasContent } from "@fitlife/plan-engine";
 import { createClient, getAuthUser } from "@/lib/supabase/server";
-import { getCurrentSubscription } from "@/lib/subscription/state";
+import {
+  getCurrentSubscription,
+  hasLiveLemonsqueezySubscription,
+} from "@/lib/subscription/state";
 import { canGenerateForFamilyChange } from "@/lib/subscription/access";
 import { TrialBanner } from "@/components/subscription/TrialBanner";
 import { RenewalRecapCard } from "./RenewalRecapCard";
@@ -135,6 +140,18 @@ export default async function DashboardPage() {
   const needsFamilyPlan = planIsReady && pendingMembers.length > 0;
   const pendingNames = pendingMembers.map((m) => m.name);
   const pendingNamesText = pendingNames.join("، ");
+  // The drain also owns two states that are NOT "someone is missing": a member
+  // removed while a run held the lock (still in the plan, gone from the
+  // roster), and a member whose row was edited after the plan was built. Both
+  // used to be unreachable — the drain mounted only for pending members, so a
+  // lone weight edit never regenerated and a ghost tab never left.
+  const liveMemberIds = new Set(familyMembers.map((m) => m.id));
+  const hasGhostMember = planMemberIds.some(
+    (id) => id !== "mom" && !liveMemberIds.has(id),
+  );
+  const hasStaleMember =
+    planIsReady && staleMemberIds(familyMembers, latestPlan?.generated_at).length > 0;
+  const drainForAlignment = planIsReady && (hasGhostMember || hasStaleMember);
 
   // Housekeeper recipe view existence — only used to add a step to the trial
   // checklist (the dashboard shortcut link itself lives on /plan now).
@@ -249,9 +266,23 @@ export default async function DashboardPage() {
 
         {showWorkoutOptIn && <WorkoutOptInBanner ownerSex={profile.sex} />}
 
+        {/* Once she has opted in, the banner is gone for good — and nothing
+            else on the dashboard showed the workout plan's state, so a
+            5-15 minute generation (or a failure) was invisible here. The
+            card was built for exactly this and never mounted. */}
+        {profile.workout_profile !== null && (
+          <div className="mb-6">
+            <WorkoutPlanCard
+              state={workoutPlan?.status ?? "optin"}
+              waitingForMeals={latestPlan?.in_progress ?? false}
+              ownerSex={profile.sex}
+            />
+          </div>
+        )}
+
         {showDeepDive && <DeepDiveBanner ownerSex={profile.sex} />}
 
-        {onboardingDone && needsFamilyPlan && !pendingBlocked && (
+        {onboardingDone && ((needsFamilyPlan && !pendingBlocked) || drainForAlignment) && (
           <DeferredMemberDrain generating={latestPlan?.in_progress ?? false} />
         )}
 
@@ -264,14 +295,17 @@ export default async function DashboardPage() {
               />
               <div className="flex-1">
                 <p className="text-brand-ink text-sm font-medium leading-relaxed">
-                  خطط باقي أفراد العائلة ({pendingNamesText}) متاحة مع الاشتراك.
-                  اشتركي ونجهّز خططهم دفعة واحدة مع وجبات العائلة المنسقة.
+                  {/* An over-limit household already pays: /pricing 409s an
+                      existing subscriber, so route them to manage the plan. */}
+                  {hasLiveLemonsqueezySubscription(subscription)
+                    ? `خطط باقي أفراد العائلة (${pendingNamesText}) تحتاج ترقية الباقة. ${g("رقّي باقتك", "رقِّ باقتك")} ونجهّز خططهم دفعة واحدة مع وجبات العائلة المنسقة.`
+                    : `خطط باقي أفراد العائلة (${pendingNamesText}) متاحة مع الاشتراك. ${g("اشتركي", "اشترك")} ونجهّز خططهم دفعة واحدة مع وجبات العائلة المنسقة.`}
                 </p>
                 <Link
-                  href="/pricing"
+                  href={hasLiveLemonsqueezySubscription(subscription) ? "/subscription" : "/pricing"}
                   className="mt-3 inline-flex items-center gap-2 bg-brand-ink hover:bg-brand-purple-900 text-white font-bold text-sm px-5 py-2.5 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-purple-900 focus-visible:ring-offset-2 focus-visible:ring-offset-brand-surface min-h-11"
                 >
-                  عرض الباقات
+                  {hasLiveLemonsqueezySubscription(subscription) ? "إدارة الاشتراك" : "عرض الباقات"}
                 </Link>
               </div>
             </div>
@@ -349,7 +383,7 @@ export default async function DashboardPage() {
         {/* Renewal-week recap — celebratory bookkeeping, never a countdown */}
         {renewalRecap && (
           <div className="mt-6">
-            <RenewalRecapCard {...renewalRecap} />
+            <RenewalRecapCard {...renewalRecap} ownerSex={profile.sex} />
           </div>
         )}
 

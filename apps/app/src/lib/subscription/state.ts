@@ -165,13 +165,20 @@ export function isPastDue(sub: SubscriptionRow): boolean {
  * she may still RE-SUBSCRIBE. Deriving the second from the first would strand
  * her — no checkout button, and no un-cancel flow to reach either. The
  * cancelled LS subscription will not renew, so a fresh one cannot double-bill.
+ *
+ * 'paused' IS live for the same reason past_due is: the LemonSqueezy
+ * subscription still exists under its id and will resume billing itself at
+ * resumes_at. Treating it as dead sent a paused customer into a brand-new
+ * checkout, whose subscription_created webhook then took over the single
+ * unique(user_id) row — orphaning the paused subscription, which LemonSqueezy
+ * kept and later billed with no id left in the app to manage it.
  */
 export function hasLiveLemonsqueezySubscription(
   sub: SubscriptionRow | null,
 ): boolean {
   if (!sub?.lemonsqueezy_subscription_id) return false;
   if (sub.status === "cancelled") return false;
-  return isSubscriptionActive(sub) || isPastDue(sub);
+  return isSubscriptionActive(sub) || isPastDue(sub) || sub.status === "paused";
 }
 
 /**

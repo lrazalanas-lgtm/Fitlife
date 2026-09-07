@@ -34,6 +34,8 @@ import {
 import { applyChildDisplayTargets } from "@/lib/plans/childTargets";
 import { applyMemberDisplayNames } from "@/lib/plans/memberNames";
 import { genderPick } from "@/lib/copy/gender";
+import { dropRemovedMembers } from "@/lib/plans/removedMembers";
+import { staleMemberIds } from "@/lib/plans/memberEdit";
 import { LogoutButton } from "../dashboard/LogoutButton";
 import { Logo } from "@/components/Logo";
 import { BackToDashboard } from "@/components/BackToDashboard";
@@ -307,13 +309,28 @@ export default async function PlanPage({
       m.days.filter((d) => d.meals.length > 0).length < daysTotal &&
       (genAttempts[m.member_id] ?? 0) < MEMBER_GEN_MAX_ATTEMPTS,
   );
+  // Members still in the plan but no longer on the roster: a removal that
+  // landed while a run held the lock. Hidden from the live view below and
+  // handed to the drain, which dispatches a roster-aligning run.
+  const liveMemberIds = new Set(familyMembers.map((m) => m.id));
+  const ghostMembers = (latest?.plan_data?.members ?? []).filter(
+    (m) => m.member_id !== "mom" && !liveMemberIds.has(m.member_id),
+  );
+  // A member edited AFTER the plan was built (weight, height, birth year, a
+  // new allergy). The drain's staleMemberIds branch existed but the drain only
+  // mounted for pending/incomplete members, so a lone edit never regenerated.
+  const staleMembers =
+    latest?.status === "ready" ? staleMemberIds(familyMembers, latest.generated_at) : [];
   const shouldDrain =
     isOnboarded &&
     latest?.status === "ready" &&
     !!latest.plan_data &&
     planHasContent(latest.plan_data) &&
     !pendingBlocked &&
-    (pendingMembers.length > 0 || hasIncompleteMember);
+    (pendingMembers.length > 0 ||
+      hasIncompleteMember ||
+      ghostMembers.length > 0 ||
+      staleMembers.length > 0);
   // «رحلتك الخاصة» entries — one per member who may keep a private weight
   // record (adults AND children now, per owner directive; the housekeeper
   // never — the shared rule in engagement/eligibility.ts). The PlanViewer shows
@@ -628,17 +645,40 @@ export default async function PlanPage({
         {!workoutView && latest?.status === "ready" && latest.plan_data && (
           <>
             {shouldDrain && <DeferredMemberDrain generating={latest.in_progress} />}
+            {latest.masked_failure && (
+              // The plan below is the PREVIOUS week: the newest run failed with
+              // nothing to show. The fallback is deliberate (a stale week beats
+              // an error screen) — silence about it was not.
+              <div
+                role="status"
+                className="rounded-2xl border border-brand-purple-900/15 bg-brand-lavender/25 px-4 py-3 mb-6 text-brand-ink text-sm leading-relaxed"
+              >
+                آخر محاولة لإنشاء خطة جديدة لم تكتمل، وهذه خطتك السابقة كما هي. يمكن
+                المحاولة مرة أخرى بعد قليل.
+                {latest.masked_failure.error_message && (
+                  <details className="mt-2 text-xs text-brand-ink-muted">
+                    <summary className="cursor-pointer">تفاصيل تقنية</summary>
+                    <p dir="ltr" className="mt-1 break-words text-start">
+                      {latest.masked_failure.error_message}
+                    </p>
+                  </details>
+                )}
+              </div>
+            )}
             <PlanViewer
               plan={applyMemberDisplayNames(
                 profile
-                  ? applyChildDisplayTargets(latest.plan_data, {
-                      mom: {
-                        member_type: profile.member_type,
-                        birth_year: profile.birth_year,
+                  ? applyChildDisplayTargets(
+                      dropRemovedMembers(latest.plan_data, liveMemberIds),
+                      {
+                        mom: {
+                          member_type: profile.member_type,
+                          birth_year: profile.birth_year,
+                        },
+                        members: familyMembers,
                       },
-                      members: familyMembers,
-                    })
-                  : latest.plan_data,
+                    )
+                  : dropRemovedMembers(latest.plan_data, liveMemberIds),
                 nameRoster,
               )}
               planId={latest.id}

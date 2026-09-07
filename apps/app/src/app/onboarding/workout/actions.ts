@@ -17,7 +17,20 @@ const EntriesSchema = z
   .array(
     z.object({
       target: z.union([z.literal("mom"), z.string().uuid()]),
-      profile: WorkoutProfileSchema,
+      // Write-side only: the chosen weekdays must number exactly the desired
+      // training days. The wizard enforces this, but the server trusted the
+      // client — a hand-crafted body could store a profile whose sessions
+      // then remap onto the wrong number of days. Read-side parsing stays
+      // lenient so a legacy profile without preferred_days still generates.
+      profile: WorkoutProfileSchema.superRefine((p, ctx) => {
+        if (p.preferred_days && p.preferred_days.length !== p.desired_days) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["preferred_days"],
+            message: "عدد أيام التدريب المختارة لا يطابق عدد الأيام المطلوبة",
+          });
+        }
+      }),
     }),
   )
   .min(1)

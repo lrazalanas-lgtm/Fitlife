@@ -136,6 +136,7 @@ export function OnboardingFamilyBuilder({
             // A male owner's spouse must not carry role="dad" — the engine
             // labels that role الأب in the family summary.
             role={isMale ? "other_adult" : "dad"}
+            ownerSex={sex}
             onboarding
             count={1}
             onComplete={advance}
@@ -148,6 +149,7 @@ export function OnboardingFamilyBuilder({
             key={`adult-${index}`}
             type="adult"
             role="other_adult"
+            ownerSex={sex}
             onboarding
             count={task.count}
             onComplete={advance}
@@ -160,6 +162,7 @@ export function OnboardingFamilyBuilder({
             key={`child-${index}`}
             type="child"
             role="son"
+            ownerSex={sex}
             onboarding
             count={task.count}
             onComplete={advance}
@@ -170,6 +173,7 @@ export function OnboardingFamilyBuilder({
         {task.kind === "preg" && (
           <PregLactSwitch
             key={`preg-${index}`}
+            ownerSex={sex}
             onboarding
             count={task.count}
             onComplete={advance}

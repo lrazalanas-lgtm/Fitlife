@@ -52,6 +52,14 @@ describe("hasLiveLemonsqueezySubscription", () => {
     expect(hasLiveLemonsqueezySubscription(sub)).toBe(true);
   });
 
+  // A paused LS subscription still exists and resumes billing on its own.
+  // Treating it as dead sent the customer into a second checkout whose
+  // webhook took over the row and orphaned the paused one.
+  it("blocks paused (LS sub kept, auto-resumes billing)", () => {
+    const sub = makeSub({ status: "paused" });
+    expect(hasLiveLemonsqueezySubscription(sub)).toBe(true);
+  });
+
   it("allows when there is no subscription row", () => {
     expect(hasLiveLemonsqueezySubscription(null)).toBe(false);
   });

@@ -1178,3 +1178,86 @@ keep their inconsistency until regenerated — display surfaces read `day_total`
 written. Guarded by `atwater.test.ts` (the screenshot figures are the header regression
 fixture). The bg function needed no mirror change — the day loop and header minting live
 in the engine.
+
+---
+
+## Pre-testing audit: fifteen lenses, fifteen refuters, fourteen real bugs (09/2026)
+
+Before the owner's manual testing pass, the whole app was audited offline — no model
+calls, no production writes. Baseline first: both suites, both typechecks, lint, and a
+REAL production build (`next build` needs the four `NEXT_PUBLIC_*` values to collect page
+data; compile + TypeScript pass without them, page-data collection does not — the
+container had none, Netlify has all four). Then 15 subsystem finders (auth, onboarding,
+family, dispatch, unattended machinery, engine day loop, engine I/O, workout, engagement,
+housekeeper/i18n, payments, PDPL/admin/DB, chat, UI/RTL/copy, duplicated-rule drift)
+produced 43 claims; every HIGH/CRITICAL claim then went to an adversarial refuter that
+had to reproduce it from the code. 14 held, 1 was refuted (the housekeeper's translation
+"spins forever" — her page remounting resets the retry counter, so only a never-reloaded
+tablet is stuck). Two mechanical sweeps came back clean: no physical Tailwind classes, no
+exclamation marks in Arabic body copy, no gender dual-writes, all three locale tables at
+key parity, no bare workspace specifiers in the function bundle, and the SDK-free shim
+implements every chain the worker actually reaches (the reads live in
+`createWorkoutPlanRows`, which the app calls with the real client).
+
+**Fixed, by customer impact.** (1) **The advisor went silent after ten exchanges**: the
+route sliced the last 20 turns of an always-odd, alternating array, so from the 11th
+exchange the window opened on an assistant turn and the Messages API refused every
+request — `lib/chat/history.ts` trims to a user-first window. (2) **A failed manual
+regenerate was invisible**: `getLatestPlan`'s previous-plan fallback served the old week
+with no signal, and the generating screen read the id mismatch as "superseded" and
+reloaded silently; `LatestPlanSummary.masked_failure` now names the failed run, the
+status route forwards it, `classifyStatusPoll` (pure) tells the three cases apart, and
+both the generating screen and /plan say «آخر محاولة لم تكتمل، وخطتك السابقة ما زالت
+كما هي». (3) **The day prompt — the call that writes ingredients — rendered conditions
+as raw slugs (`حالات: ibs`) and never carried an individual member's dietary
+restriction**; the August roster fix had reached only the skeleton, which is why لبنة
+kept landing on a lactose-free member's plate. Both now use the roster's rules
+(`restrictionRules`, `conditionLabels`), pinned by day-prompt tests. (4) **A member's
+weight/height edit never regenerated**: the personal form sent `?saved=1` (no nudge),
+and `staleMemberIds` was unreachable because the drain mounted only for pending or
+incomplete members — /plan and /dashboard now mount the drain for stale members and for
+GHOSTS (a member removed while a run held the lock stays in `plan_data` forever; the
+live view hides them via `dropRemovedMembers` and the drain dispatches a roster-aligning
+carry-over run, which makes no model call). (5) **A failed workout regeneration shadowed
+the household's whole program** (one row per household, no fallback) — `workoutPlanRows.ts`
+is the pure previous-plan rule, mirrored from meals. (6) **The workout run anchored its
+budget AFTER the meals-first wait** (up to 8 min), so it believed it had the full 15
+minutes and could be SIGKILLed mid-call with both rows left 'started'; the worker now
+passes its invocation start. (7) **A phase-1 (skeleton) failure never charged
+`gen_attempts`** — snapshot() is the only writer and a skeleton throw never reaches it —
+so the sweeper (daily cap only) and the page-mounted drain (no cap) re-dispatched the
+same doomed refill; the error now carries `attemptedMemberIds` and the worker's catch
+charges them on the SOURCE ready plan, which is the row every re-dispatch decision reads.
+(8) **A paused LemonSqueezy subscription counted as dead**, so /api/checkout let a paused
+customer buy a second subscription whose webhook took over the row and orphaned the
+first (dormant under free-access mode, live the day it is turned off). (9) The advisor
+told a household with a complete plan that it had none for the whole skeleton phase of
+any regeneration — it read `getLatestPlan` instead of `getCookablePlan`. (10) The
+workout status card built for the dashboard was never mounted; after opt-in nothing
+showed the plan generating, ready, or failed. (11) `addFamilyMember`/`updateFamilyMember`
+never enforced the member half of the doctor gate server-side — and a member row failing
+it makes `buildPlanContext` refuse the WHOLE household with no self-service recovery.
+Plus: the onboarding family builder never threaded `ownerSex` (male owners got feminine
+member wizards), `preferred_days` was never validated against `desired_days` on the
+write side, the admin ops pages hand-rolled the doctor gate (wrongly, twice) and a stale
+chat cap of 30, the export omitted `chat_messages`, removal never purged
+`member_exceptions`, no `not-found.tsx` existed (Next's English 404 on a stale history
+link), the mobile nav close button was 28px, ages froze at cold start (module-scope
+`new Date()` → `riyadhCurrentYear()`), two paywall CTAs sent already-paying customers to
+/pricing (which 409s them), the family card had no label for the two promoted goals,
+`unexplained_symptoms` sat in the gate list with no chip, and six owner-directed strings
+were hard-coded feminine. Also found on the way in: the analytics consent race
+(withdrawn while the SDK import was in flight → it initialised anyway; see the commit)
+and the inline path's terminal writes keyed by plan alone.
+
+**Flagged, not fixed (owner decisions or post-launch).** The weekly generation quota
+counts every chain hop, sweeper refill and drain fill as a separate slot — moot under
+free-access mode, real the day it is off; needs a `quota_exempt` marker on system-minted
+plans (the refuter's plan is in the session record). A housekeeper tablet never reloaded
+across a credit outage does not self-heal (the remount does). Cache tokens on a call
+that dies mid-stream are not billed into the recorded cost. The second-chance day wave
+double-counts the first wave's failures in `error_message`. The generated
+`database.types.ts` is still stale for 00017+ (documented casts). None of these blocks
+testing. The lesson this pass adds to the two before it: **a fix that reaches one of two
+prompts, one of two plan kinds, or one of two mount conditions is half a fix — grep for
+the sibling every time.**

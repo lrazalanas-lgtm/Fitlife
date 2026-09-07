@@ -439,6 +439,29 @@ async function fetchPlanById(
 // plan in the POST body grew the payload with every carried-over member and, past
 // ~3 members, crossed Netlify's background-function invoke payload limit → a
 // platform 500 at invoke time.
+/**
+ * The newest READY plan's row (id + raw plan_data) — the source a carry-over
+ * run built on, and the row every re-dispatch decision (sweeper, drain,
+ * chain) reads gen_attempts from. Used to charge attempts after a phase-1
+ * failure, which no other write records.
+ */
+async function fetchPriorReadyRow(
+  base: string,
+  serviceKey: string,
+  userId: string,
+  currentMealPlanId: string,
+): Promise<{ id: string; plan_data: Record<string, unknown> } | null> {
+  const row = await sbSelectOne(
+    base,
+    serviceKey,
+    "meal_plans",
+    `user_id=eq.${userId}&status=eq.ready&id=neq.${currentMealPlanId}&select=id,plan_data&order=created_at.desc&limit=1`,
+  );
+  if (!row || typeof row.id !== "string" || !row.plan_data || typeof row.plan_data !== "object")
+    return null;
+  return { id: row.id, plan_data: row.plan_data as Record<string, unknown> };
+}
+
 async function fetchPriorPlan(
   base: string,
   serviceKey: string,
@@ -792,6 +815,9 @@ const handler = async (req: Request): Promise<Response> => {
   // ── Workout mode: generate the opt-in exercise program ──
   if (body.mode === "workout") {
     const workoutPlanId = body.workoutPlanId!;
+    // Captured BEFORE the meals-first wait below: the run's budget is the
+    // invocation's, and the wait can spend up to 8 minutes of it.
+    const invocationStartMs = Date.now();
     // Idempotency guard (same contract as the meal path): a replayed invoke
     // for a settled row must not burn a second run. Oldest generation row for
     // this workout_plan_id is the dispatch row.
@@ -910,6 +936,7 @@ const handler = async (req: Request): Promise<Response> => {
         workoutPlanId,
         context,
         weekStartDate: body.weekStartDate ?? new Date().toISOString().slice(0, 10),
+        startMs: invocationStartMs,
       });
       return new Response(JSON.stringify({ ok: true }), { status: 200 });
     } catch (err) {
@@ -1411,6 +1438,50 @@ const handler = async (req: Request): Promise<Response> => {
     // The one that matters: a whole meal generation died. The DB row only ever
     // kept the message, so the stack and the failing step were unrecoverable.
     await captureToSentry(err, { step: "meal-generation", userId, mealPlanId });
+    // A wide carry-over refill that died in PHASE 1 never reached snapshot(),
+    // so gen_attempts was never charged and the sweeper/drain kept
+    // re-dispatching the same doomed refill (the sweeper's daily cap was the
+    // only bound; the page-mounted drain has none). Every consumer reads
+    // gen_attempts off the newest READY plan — the source this run carried
+    // from — so that is the row to charge, not the failed child.
+    const attemptedMemberIds = (err as { attemptedMemberIds?: unknown }).attemptedMemberIds;
+    const wideCarryOver =
+      body.carryOver === true &&
+      !body.onlyMemberId &&
+      !body.regenerateMemberId &&
+      !body.regenerateSharedGroup &&
+      !body.regenScope;
+    if (wideCarryOver && Array.isArray(attemptedMemberIds) && attemptedMemberIds.length > 0) {
+      try {
+        const prior = await fetchPriorReadyRow(supabaseUrl, serviceKey, userId, mealPlanId);
+        if (prior) {
+          const existing = prior.plan_data.gen_attempts;
+          const gen: Record<string, number> =
+            existing && typeof existing === "object"
+              ? { ...(existing as Record<string, number>) }
+              : {};
+          for (const id of attemptedMemberIds) {
+            if (typeof id === "string") gen[id] = (gen[id] ?? 0) + 1;
+          }
+          await sbUpdate(
+            supabaseUrl,
+            serviceKey,
+            "meal_plans",
+            `id=eq.${prior.id}&status=eq.ready`,
+            { plan_data: { ...prior.plan_data, gen_attempts: gen } },
+          );
+          console.warn(
+            "[generate-plan-background] phase-1 failure charged gen_attempts on the source plan",
+            { priorId: prior.id, attemptedMemberIds },
+          );
+        }
+      } catch (chargeErr) {
+        console.error(
+          "[generate-plan-background] could not charge gen_attempts after a phase-1 failure",
+          chargeErr,
+        );
+      }
+    }
     try {
       await sbUpdate(
         supabaseUrl,

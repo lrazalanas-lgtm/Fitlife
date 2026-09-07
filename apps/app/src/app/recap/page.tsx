@@ -102,7 +102,7 @@ export default async function RecapPage() {
               href="/plan"
               className="inline-flex items-center justify-center min-h-11 px-5 rounded-full bg-brand-purple-900 text-white hover:bg-brand-purple-700 text-sm font-bold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-purple-900 focus-visible:ring-offset-2"
             >
-              افتحي خطتك
+              {g("افتحي خطتك", "افتح خطتك")}
             </Link>
           </section>
         ) : (
@@ -217,7 +217,7 @@ export default async function RecapPage() {
               >
                 <Lock className="size-4 text-brand-purple-900 mt-1 shrink-0" aria-hidden="true" />
                 <p className="text-sm text-brand-purple-900 leading-relaxed">
-                  بينكِ وبين نفسك: وزنك تغيّر{" "}
+                  {g("بينكِ وبين نفسك", "بينك وبين نفسك")}: وزنك تغيّر{" "}
                   <span className="font-bold" dir="ltr">
                     {AR_NUM.format(Math.abs(recap.weight_delta_kg))}
                   </span>{" "}
